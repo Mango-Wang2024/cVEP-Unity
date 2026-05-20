@@ -1,0 +1,50 @@
+[streams]
+data_stream_name = "mockup"
+marker_stream_name = "cvep-speller-stream"
+decoder_stream_name = "cvep-decoder-stream"
+buffer_size_s = 5.0
+padding_size_s = 0.5
+
+[stimulus]
+presentation_rate_hz = 60
+cue_marker = "start_cue"
+trial_marker = "start_trial"
+n_keys = 4
+tmin_s = 0.0
+tmax_s = 4.2
+
+[data]
+data_root = "/Users/wang/dp-cvep/cvep_speller_env/data"
+training_files_glob = "sub-P001_ses-S001*.xdf"
+selected_channels = [ 0, 1, 2, 3, 4, 5,]
+capfile = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/biosemi6.loc"
+target_freq_hz = 120
+passband_hz = [ 6, 40,]
+
+[decoder]
+decoder_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder.joblib"
+decoder_meta_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder_meta.json"
+decoder_subset_layout_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder_subset_layout.json"
+event = "contrast"
+onset_event = true
+encoding_length_s = 0.3
+tmin_s = 0.1
+stopping = "beta"
+segment_time_s = 0.1
+target_accuracy = 0.999
+min_time_s = 1.0
+max_time_s = 4.0
+cr = 1.0
+trained = false
+soft_decision_enabled = true
+soft_decision_smoothing = 0.5
+soft_decision_min_confidence = 0.0
+soft_decision_temperature = 1.0
+
+[training]
+codes_file = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
+
+[online]
+codes_file = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
+sleep_s = 0.1
+max_eval_time_s = 4.3

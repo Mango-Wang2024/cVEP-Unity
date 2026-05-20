@@ -1,0 +1,1 @@
+python -m control_room.main --setup_cfg_path="/Users/wang/dp-cvep/cvep_speller_env/dp-control-room/configs/cvep_speller.toml"

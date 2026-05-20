@@ -1,0 +1,93 @@
+[speller]
+images_dir = "./cvep_speller/images/"
+codes_dir = "./cvep_speller/codes/"
+presentation_rate_hz = 60
+quit_phrase = "!!"
+key_space = "space"
+key_clear = "<<"
+key_backspace = "<-"
+key_autocomplete = ">>"
+key_shift = "shift"
+key_text2speech = "speaker"
+
+[decoder]
+decoder_subset_layout_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder_subset_layout.json"
+
+[streams]
+marker_stream_name = "cvep-speller-stream"
+decoder_stream_name = "cvep-decoder-stream"
+
+[training]
+codes_file = "mgold_61_6521.npz"
+n_trials = 12
+
+[online]
+codes_file = "mgold_61_6521.npz"
+n_trials = 10
+
+[speller.screen]
+id = 0
+resolution = [ 1280, 720,]
+width_cm = 53.0
+distance_cm = 60.0
+background_color = [ 0, 0, 0,]
+refresh_rate_hz = 60
+full_screen = false
+
+[speller.timing]
+cue_s = 0.7
+trial_s = 4.2
+feedback_s = 0.7
+iti_s = 0.3
+stop_s = 5.0
+
+[speller.stt]
+enabled = false
+width_dva = 2.2
+height_dva = 2.2
+colors = [ "black", "white",]
+
+[speller.keys]
+shift_enabled = false
+width_dva = 3.0
+height_dva = 3.0
+space_dva = 0.5
+colors = [ "black", "white", "green", "blue",]
+keys_upper = [ [ "1", "2" ], [ "3", "4" ] ]
+keys_lower = [ [ "1", "2" ], [ "3", "4" ] ]
+
+[speller.text_fields]
+height_dva = 2.3
+background_color = [ -0.05, -0.05, -0.05,]
+
+[speller.controls]
+continue = [ "c",]
+quit = [ "q", "escape",]
+
+[speller.markers]
+cue_start = "start_cue"
+cue_stop = "stop_cue"
+trial_start = "start_trial"
+trial_stop = "stop_trial"
+feedback_start = "start_feedback"
+feedback_stop = "stop_feedback"
+iti_start = "start_iti"
+iti_stop = "stop_iti"
+
+[speller.text2speech]
+enabled = false
+rate = 225
+volume = 1.0
+voice_idx = 0
+
+[speller.autocomplete]
+enabled = false
+mode = "offline"
+
+[speller.autocomplete.online]
+models = [ "gemini-1.5-pro", "gemini-1.5-flash-8b", "gemini-1.5-flash",]
+model_idx = 2
+api_key = ""
+instructions = "<OBJECTIVE_AND_PERSONA>\nYou are an autocorrect and autocomplete assistant. Your task is to correct the given sentence then complete the last word or phrase. If the given sentence is random symbols, respond with the exact given sentence. \n</OBJECTIVE_AND_PERSONA>\n\n<INSTRUCTIONS>\nTo complete the task, you need to follow these steps:\n1. Understand the current word or word fragment.\n2. Understand the context of the sentence.\n3. Correct any grammatical or spelling errors.\n4. Finish the last word or phrase naturally.\n</INSTRUCTIONS>\n\n<CONSTRAINTS>\nDos and don'ts for the following aspects\n1. Do try to complete the last word or phrase.\n2. Do fix any mistakes or errors you notice.\n3. Don't use special characters. \n</CONSTRAINTS>"
+temperature = 1.0
+output_length = 20

@@ -1,0 +1,39 @@
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+pythonpath = [
+  "./"
+]
+testpaths = [
+    "tests",
+    "./"
+]
+filterwarnings = ["ignore:::.*fire.core"]
+
+[project]
+name = "dp-mockup-streamer"
+version = "0.2.0"
+description = "A lightweight LSL mockup streamer for Dareplane with fast startup"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "dareplane_utils>=0.0.8",
+    "fire>=0.5.0",
+    "numpy",
+    "pylsl>=1.16.2",
+]
+
+[project.optional-dependencies]
+files = [
+    "mne>=1.8.0",
+    "pyxdf>=1.16.8",
+]
+dev = [
+    "pytest>=8.3.2",
+]
+all = [
+    "dp-mockup-streamer[files,dev]",
+]
+
+[project.scripts]
+mockup-random = "mockup_streamer.random_cli:cli"
