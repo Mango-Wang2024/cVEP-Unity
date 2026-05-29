@@ -14,17 +14,18 @@ tmin_s = 0.0
 tmax_s = 4.2
 
 [data]
-data_root = "/Users/wang/dp-cvep/cvep_speller_env/data"
+data_root = "/Users/wang/dp-cvep-1/cvep_speller_env/data"
 training_files_glob = "sub-P001_ses-S001*.xdf"
 selected_channels = [ 0, 1, 2, 3, 4, 5,]
-capfile = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/biosemi6.loc"
+capfile = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/biosemi6.loc"
 target_freq_hz = 120
 passband_hz = [ 6, 40,]
 
 [decoder]
-decoder_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder.joblib"
-decoder_meta_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder_meta.json"
-decoder_subset_layout_file = "/Users/wang/dp-cvep/cvep_speller_env/data/decoder_subset_layout.json"
+training_mode = "zero"
+decoder_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder.joblib"
+decoder_meta_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_meta.json"
+decoder_subset_layout_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_subset_layout.json"
 event = "contrast"
 onset_event = true
 encoding_length_s = 0.3
@@ -42,9 +43,9 @@ soft_decision_min_confidence = 0.0
 soft_decision_temperature = 1.0
 
 [training]
-codes_file = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
+codes_file = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
 
 [online]
-codes_file = "/Users/wang/dp-cvep/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
+codes_file = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-speller/cvep_speller/codes/mgold_61_6521.npz"
 sleep_s = 0.1
 max_eval_time_s = 4.3

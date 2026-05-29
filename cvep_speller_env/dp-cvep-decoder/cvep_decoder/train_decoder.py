@@ -15,6 +15,7 @@ import toml
 from scipy.signal import resample
 
 from cvep_decoder.utils.logging import logger
+from cvep_decoder.zero_training import ZeroTrainingClassifier
 
 
 @dataclass
@@ -134,6 +135,25 @@ def create_classifier(
     logger.setLevel(10)
 
     cmeta = classifier_meta_from_cfg(cfg)
+    training_mode = cfg["decoder"].get("training_mode", "calibration").lower()
+
+    if training_mode == "zero":
+        V = np.repeat(
+            np.load(cfg["online"]["codes_file"])["codes"],
+            int(cmeta.sfreq / cmeta.presentation_rate),
+            axis=1,
+        )
+        logger.info("Creating zero-training decoder without calibration data.")
+        logger.debug(f"The stimuli V are of shape: {V.shape} (codes x samples)")
+
+        model = get_zero_training_model(cmeta, V)
+        subset, layout = select_codes_and_layout(model, V, cfg)
+        save_classifier_outputs(model, cmeta, subset, layout, cfg)
+        return 0
+
+    if training_mode != "calibration":
+        logger.error(f"Unknown decoder training_mode '{training_mode}'. Use 'zero' or 'calibration'.")
+        return 1
 
     t_files = get_training_data_files(cfg)  #Still uses calibration/training data from .xdf files:
 
@@ -230,6 +250,67 @@ def create_classifier(
         logger.debug(f"New stimuli V are of shape: {V.shape} (codes x samples)")
         model.estimator.set_stimulus(V)
 
+    subset, layout = select_codes_and_layout(model, V, cfg)
+    save_classifier_outputs(model, cmeta, subset, layout, cfg)
+
+    # Visualize classifier
+    plot_rcca_model_early_stop(model, acc, dur, n_folds, cfg)
+    plt.show()  # halts here until the figure is closed
+
+    return 0
+
+
+def get_rcca_model(
+    cmeta: ClassifierMeta,
+    V: NDArray,
+) -> pyntbci.classifiers.rCCA:
+    """
+    Fit a standard rCCA model on labeled training data.
+
+    Parameters
+    ----------
+    cmeta: ClassifierMeta
+        The classifier hyperparameters.
+    V: NDArray
+        The stimulus matrix of shape (n_codes x n_samples).
+
+    Returns
+    -------
+    rcca: pyntbci.classifiers.rCCA
+        An untrained trained rCCA classifier.
+    """ 
+    rcca = pyntbci.classifiers.rCCA(    #rCCA model
+        stimulus=V, #This is the matrix of flashing codes for all keys.
+        fs=int(cmeta.sfreq),    #EEG sampling rate.
+        event=cmeta.event,
+        onset_event=cmeta.onset_event,
+        encoding_length=cmeta.encoding_length,  #How long the visual brain response is modeled after each flash.
+        tmin=cmeta.ctmin,   #Time offset between the visual stimulus marker and the EEG response.
+    )
+    return rcca
+
+
+def get_zero_training_model(
+    cmeta: ClassifierMeta,
+    V: NDArray,
+) -> ZeroTrainingClassifier:
+    return ZeroTrainingClassifier(
+        stimulus=V,
+        fs=int(cmeta.sfreq),
+        event=cmeta.event,
+        onset_event=cmeta.onset_event,
+        response_length=cmeta.encoding_length,
+        tmin=cmeta.ctmin,
+        min_time=cmeta.min_time,
+        max_time=cmeta.max_time,
+    )
+
+
+def select_codes_and_layout(
+    model,
+    V: NDArray,
+    cfg: dict,
+) -> tuple[NDArray, NDArray]:
     # Optimize subset of codes
     n_keys = cfg["stimulus"]["n_keys"]
     if n_keys != 0 and n_keys < V.shape[0]:
@@ -298,9 +379,7 @@ def create_classifier(
         51: [52],
         52: [],
     }
-    if n_keys == 53:
-        pass
-    else:
+    if n_keys != 53:
         keyboard_dict = dict()
 
     # Convert the hard-coded dict into nd.array of shape (neighbours, 2).
@@ -320,6 +399,16 @@ def create_classifier(
         layout = np.arange(V.shape[0])
         logger.debug(f"Skipped optimal layout for {n_keys} keys because no neighbour graph is defined")
 
+    return subset, layout
+
+
+def save_classifier_outputs(
+    model,
+    cmeta: ClassifierMeta,
+    subset: NDArray,
+    layout: NDArray,
+    cfg: dict,
+) -> None:
     # Save classifier
     out_file = cfg["decoder"]["decoder_file"]
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
@@ -340,45 +429,10 @@ def create_classifier(
         "layout": layout.tolist(),
     }
     out_file = cfg["decoder"]["decoder_subset_layout_file"]
+    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, "w") as fid:
         json.dump(json_data, fid)
         logger.info(f"Subset and layout saved to {out_file}")
-
-    # Visualize classifier
-    plot_rcca_model_early_stop(model, acc, dur, n_folds, cfg)
-    plt.show()  # halts here until the figure is closed
-
-    return 0
-
-
-def get_rcca_model(
-    cmeta: ClassifierMeta,
-    V: NDArray,
-) -> pyntbci.classifiers.rCCA:
-    """
-    Fit a standard rCCA model on labeled training data.
-
-    Parameters
-    ----------
-    cmeta: ClassifierMeta
-        The classifier hyperparameters.
-    V: NDArray
-        The stimulus matrix of shape (n_codes x n_samples).
-
-    Returns
-    -------
-    rcca: pyntbci.classifiers.rCCA
-        An untrained trained rCCA classifier.
-    """ 
-    rcca = pyntbci.classifiers.rCCA(    #rCCA model
-        stimulus=V, #This is the matrix of flashing codes for all keys.
-        fs=int(cmeta.sfreq),    #EEG sampling rate.
-        event=cmeta.event,
-        onset_event=cmeta.onset_event,
-        encoding_length=cmeta.encoding_length,  #How long the visual brain response is modeled after each flash.
-        tmin=cmeta.ctmin,   #Time offset between the visual stimulus marker and the EEG response.
-    )
-    return rcca
 
 
 def get_rcca_model_early_stop(
