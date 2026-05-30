@@ -212,10 +212,10 @@ class OnlineDecoder:
 
     def init_all(self) -> int:
         """Return an int as this is exposed as a PCOMM `CONNECT_DECODER`"""
-        self.connect_marker_stream()
         self.connect_data_stream()
         self.create_filterbank()
         self.create_decoder_stream()
+        self.connect_marker_stream()
         return 0
 
     # ------------------ Online functionality ---------------------------------

@@ -1,5 +1,5 @@
 [streams]
-data_stream_name = "mockup"
+data_stream_name = "obci_eeg1"
 marker_stream_name = "cvep-speller-stream"
 decoder_stream_name = "cvep-decoder-stream"
 buffer_size_s = 5.0
@@ -16,13 +16,15 @@ tmax_s = 4.2
 [data]
 data_root = "/Users/wang/dp-cvep-1/cvep_speller_env/data"
 training_files_glob = "sub-P001_ses-S001*.xdf"
-selected_channels = [ 0, 1, 2, 3, 4, 5,]
-capfile = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/biosemi6.loc"
-target_freq_hz = 120
+# Cyton channel order: 0=N1P/Cz, 1=N2P/O2, 2=N3P/TP8, 3=N4P/FPz,
+# 4=N5P/O1, 5=N6P/Oz, 6=N7P/Pz, 7=N8P/TP7.
+selected_channels = [ 0, 1, 2, 3, 4, 5, 6, 7,]
+capfile = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/openbci8_headset.loc"
+target_freq_hz = 60
 passband_hz = [ 6, 40,]
 
 [decoder]
-training_mode = "zero"
+training_mode = "calibration"
 decoder_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder.joblib"
 decoder_meta_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_meta.json"
 decoder_subset_layout_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_subset_layout.json"
