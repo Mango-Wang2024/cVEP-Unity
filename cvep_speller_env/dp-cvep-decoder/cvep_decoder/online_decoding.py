@@ -100,6 +100,7 @@ class OnlineDecoder:
         self.classifier_meta = None
 
         self.input_mrk_sw: StreamWatcher | None = None
+        self.marker_inlet: pylsl.StreamInlet | None = None
         self.input_sw: StreamWatcher | None = None
         self.input_sfreq: int | None = None
         self.input_chs_info: list[dict[str, str]] | None = None
@@ -108,6 +109,7 @@ class OnlineDecoder:
         self.band = None
         self.classifier_input_sfreq = None
         self.last_soft_position: NDArray | None = None
+        self.last_insufficient_log_time: float = 0.0
 
     # -------- Connection and initialization methods --------------------------
     def load_model(
@@ -143,12 +145,20 @@ class OnlineDecoder:
 
     def connect_marker_stream(self):
         logger.info(f'Connecting to marker stream "{self.marker_stream_name}".')
-        self.input_mrk_sw = StreamWatcher(self.marker_stream_name, buffer_size_s=self.buffer_size_s, logger=logger)
-        self.input_mrk_sw.connect_to_stream()
+        streams = []
+        while len(streams) == 0:
+            streams = pylsl.resolve_byprop("name", self.marker_stream_name, timeout=1)
+            if len(streams) == 0:
+                logger.info(f'Waiting for marker stream "{self.marker_stream_name}".')
 
-        if len(self.input_mrk_sw.channel_names) != 1:
+        if len(streams) > 1:
+            logger.warning(f'Selecting first marker stream named "{self.marker_stream_name}".')
+
+        if streams[0].channel_count() != 1:
             logger.error("The marker stream should have exactly one channel.")
             return 1
+
+        self.marker_inlet = pylsl.StreamInlet(streams[0])
 
         return 0
 
@@ -212,15 +222,27 @@ class OnlineDecoder:
 
     def init_all(self) -> int:
         """Return an int as this is exposed as a PCOMM `CONNECT_DECODER`"""
+        logger.info("[CHECK] CONNECT DECODER pressed: initializing decoder streams.")
         self.connect_data_stream()
+        logger.info(
+            f'[CHECK] Connected EEG stream "{self.data_stream_name}" '
+            f"with sfreq={self.input_sfreq} Hz and channels={self.input_sw.channel_names}."
+        )
         self.create_filterbank()
+        logger.info("[CHECK] Filter bank created.")
         self.create_decoder_stream()
+        logger.info(
+            f'[CHECK] Decoder output stream "{self.decoder_stream_name}" created '
+            f"with soft_decision_enabled={self.soft_decision_enabled}."
+        )
         self.connect_marker_stream()
+        logger.info(f'[CHECK] Connected marker stream "{self.marker_stream_name}".')
         return 0
 
     # ------------------ Online functionality ---------------------------------
 
     def run(self) -> tuple[threading.Thread, threading.Event]:
+        logger.info("[CHECK] DECODE ONLINE pressed: decoder run loop starting.")
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._run_loop,
@@ -234,7 +256,6 @@ class OnlineDecoder:
         logger.debug(f"Updating the decoder - {self.is_decoding=}")
 
         self.input_sw.update()
-        self.input_mrk_sw.update()
         self._filter()
 
         # check if decoding should start
@@ -254,22 +275,49 @@ class OnlineDecoder:
                         self._classify(xs)
 
     def check_if_decoding_should_start(self):
-        if self.input_mrk_sw is None:
+        if self.marker_inlet is None:
             logger.error("No marker stream connected, cannot start decoding based on markers.")
+            return
 
-        if self.input_mrk_sw.n_new > 0:
-            markers = self.input_mrk_sw.unfold_buffer()[-self.input_mrk_sw.n_new:, 0]
-            markers_t = self.input_mrk_sw.unfold_buffer_t()[-self.input_mrk_sw.n_new:]
+        markers = []
+        markers_t = []
+        for _ in range(128):
+            sample, timestamp = self.marker_inlet.pull_sample(timeout=0.0)
+            if sample is None:
+                break
+            markers.append(sample[0])
+            markers_t.append(timestamp)
+
+        if len(markers) > 0:
+            markers = np.asarray(markers)
+            markers_t = np.asarray(markers_t)
 
             if self.start_eval_marker in markers:
-                logger.debug(f"Starting decoding based on marker '{self.start_eval_marker}'")
+                logger.info(f"[CHECK] Received marker '{self.start_eval_marker}': decoding started.")
                 self.is_decoding = True
-                self.input_mrk_sw.n_new = 0
                 self.internal_decoding_start_time = time.time()
 
                 # get time stamp of start_eval_marker --> consider inputs for epoch from this onwards
                 idx = np.where(markers == self.start_eval_marker)[0]
-                self.start_eval_time = markers_t[idx]
+                marker_lsl_time = float(markers_t[idx[-1]])
+                marker_time = marker_lsl_time
+                eeg_times = self.input_sw.unfold_buffer_t()
+                if len(eeg_times) > 0 and not (eeg_times[0] <= marker_time <= eeg_times[-1]):
+                    marker_age_s = max(0.0, pylsl.local_clock() - marker_lsl_time)
+                    fallback_latency_s = min(max(2 * self.t_sleep_s, 0.1), 0.25)
+                    converted_marker_time = float(eeg_times[-1]) - fallback_latency_s
+                    clipped_marker_time = float(
+                        np.clip(converted_marker_time, eeg_times[0], eeg_times[-1])
+                    )
+                    logger.info(
+                        "[CHECK] Marker timestamp is outside current EEG buffer "
+                        f"(marker={marker_lsl_time:.3f}, eeg_start={eeg_times[0]:.3f}, "
+                        f"eeg_end={eeg_times[-1]:.3f}, marker_age={marker_age_s:.3f}s); "
+                        f"using latest EEG time minus {fallback_latency_s:.3f}s: "
+                        f"{clipped_marker_time:.3f}."
+                    )
+                    marker_time = clipped_marker_time
+                self.start_eval_time = marker_time
 
     def _filter(self):
         if self.input_sw is None:
@@ -283,7 +331,16 @@ class OnlineDecoder:
 
     def _create_epoch(self) -> NDArray:
         x = self.filterbank.get_data()[:, :, 0]
-        t = self.input_sw.unfold_buffer_t()
+        t = self.filterbank.ring_buffer.unfold_buffer_t()[-x.shape[0]:]
+
+        if x.shape[0] != len(t):
+            n = min(x.shape[0], len(t))
+            logger.info(
+                "[CHECK] Aligning filtered EEG/timestamp buffers: "
+                f"x_samples={x.shape[0]}, t_samples={len(t)}, using {n}."
+            )
+            x = x[-n:, :]
+            t = t[-n:]
 
         # Find marker onset timepoint
         idx = np.argmin(np.abs(t - self.start_eval_time))
@@ -329,22 +386,28 @@ class OnlineDecoder:
 
         if x.shape[2] < int(self.t_sleep_s * self.classifier_input_sfreq):
             logger.debug(f"Classifying skipped as insufficient data: {x.shape[2]=}.")
+            if time.time() - self.last_insufficient_log_time > 1.0:
+                logger.info(
+                    "[CHECK] Decoder has marker but not enough usable EEG yet: "
+                    f"{x.shape[2]} samples after padding/resampling."
+                )
+                self.last_insufficient_log_time = time.time()
             y = -1
         else:
             logger.debug(f"Classifying epoch of shape {x.shape} (n_trials x n_channels x n_samples).")
             y = self.classifier.predict(x)[0]   #predicts the selected key
-            logger.debug(f"Classified with prediction {y}.")
+            logger.info(f"[CHECK] Decoder classified with prediction {y}.")
 
         # If y=-1 then the classifier is not yet sufficiently certain to emit the classification
         if y >= 0:
             if self.soft_decision_enabled:
                 position = self._soft_decision_position(x)
-                logger.debug(f"Pushing soft position {position}.")
+                logger.info(f"[CHECK] Decoder pushing coordinate {position}.")
                 self.output_sw.push_sample(
                     [np.float32(position[0]), np.float32(position[1])]
                 )
             else:
-                logger.debug(f"Pushing prediction {y}.")
+                logger.info(f"[CHECK] Decoder pushing class {y}.")
                 self.output_sw.push_sample([np.int64(y)])
             self.is_decoding = False
 

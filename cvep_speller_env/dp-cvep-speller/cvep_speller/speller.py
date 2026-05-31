@@ -13,10 +13,9 @@ import psychopy
 import pyttsx3
 import toml
 from dareplane_utils.logging.logger import get_logger
-from dareplane_utils.stream_watcher.lsl_stream_watcher import StreamWatcher
 from fire import Fire
 from psychopy import event, misc, monitors, visual
-from pylsl import StreamInfo, StreamOutlet
+from pylsl import StreamInfo, StreamInlet, StreamOutlet, resolve_byprop
 
 from cvep_speller.utils.logging import logger
 
@@ -114,8 +113,6 @@ class Speller(object):
             size=screen_resolution,
             color=background_color,
             fullscr=full_screen,
-            waitBlanking=False,
-            allowGUI=not full_screen,
             # infoMsg="",
         )
         self.window.setMouseVisible(False)
@@ -135,7 +132,8 @@ class Speller(object):
         self.last_selected_position: tuple[float, float] | None = None
         self.key_map: dict[int, str] = {}
         self.highlights: dict = {}
-        self.decoder_sw = None
+        self.decoder_inlet = None
+        self.decoding_event_seen = False
 
         # Set up variables for text to speech, autocompletion, and shifting keyboard layout
         self.sample_idx = 0  # used to iterate through sample symbols, iterated in handle_decoding_event
@@ -278,8 +276,15 @@ class Speller(object):
     def connect_to_decoder_lsl_stream(self) -> None:
         name = self.cfg["streams"]["decoder_stream_name"]
         logger.info(f'Connecting to decoder stream "{name}".')
-        self.decoder_sw = StreamWatcher(name=name)
-        self.decoder_sw.connect_to_stream()
+        streams = []
+        while len(streams) == 0:
+            streams = resolve_byprop("name", name, timeout=1)
+            if len(streams) == 0:
+                logger.info(f'Waiting for decoder stream "{name}".')
+        if len(streams) > 1:
+            logger.warning(f'Selecting first decoder stream named "{name}".')
+        self.decoder_inlet = StreamInlet(streams[0])
+        logger.info(f'[CHECK] Decoder stream "{name}" connected.')
 
     def get_pixels_per_degree(
         self,
@@ -409,7 +414,7 @@ class Speller(object):
                     break
 
             # Check selection marker
-            if self.decoder_sw is not None:
+            if self.decoder_inlet is not None:
                 if self.has_decoding_event():
                     self.handle_decoding_event()
                     break
@@ -462,42 +467,76 @@ class Speller(object):
         Check if the LSL stream contained a `speller_select <key_idx>` marker.
         """
 
-        # disregard all previous data
-        self.decoder_sw.n_new = 0
-        self.decoder_sw.update()
+        if self.decoder_inlet is None:
+            return False
 
-        if self.decoder_sw.n_new != 0:
-            prediction = self.decoder_sw.unfold_buffer()[
-                -self.decoder_sw.n_new :
-            ]
+        latest_sample = None
+        for _ in range(32):
+            sample, _ = self.decoder_inlet.pull_sample(timeout=0.0)
+            if sample is None:
+                break
+            latest_sample = sample
 
-            logger.debug(f"Received: prediction={prediction}")
+        if latest_sample is None:
+            return False
 
-            if prediction.ndim == 2 and prediction.shape[1] >= 2:
-                x_pos, y_pos = prediction[-1, :2]
-                if x_pos >= 0 and y_pos >= 0:
-                    self.last_selected_key_idx = None
-                    self.last_selected_position = (float(x_pos), float(y_pos))
-                    logger.debug(f"Soft position: {self.last_selected_position}")
-                    return True
+        prediction = np.asarray(latest_sample)
+        logger.debug(f"Received: prediction={prediction}")
 
-            prediction = prediction.flatten()
-
-            # selections = [
-            #     c
-            #     for c in prediction
-            #     if isinstance(c, str) and c.startswith("speller_select")
-            # ]
-            selections = prediction[prediction >= 0]
-
-            if len(selections) > 0:
-                # In case multiple decode markers arrive -> consider only last
-                # self.last_selected_key_idx = int(
-                #     selections[-1].replace("speller_select", "")
-                # )
-                self.last_selected_key_idx = int(selections[-1])
-                logger.debug(f"Selection: {self.last_selected_key_idx}, {selections=}")
+        if prediction.ndim == 1 and prediction.shape[0] >= 2:
+            x_pos, y_pos = prediction[:2]
+            if x_pos >= 0 and y_pos >= 0:
+                self.last_selected_key_idx = None
+                self.last_selected_position = (float(x_pos), float(y_pos))
+                self.decoding_event_seen = True
+                logger.info(f"[CHECK] Speller received coordinate ({x_pos:.3f}, {y_pos:.3f}).")
+                logger.debug(f"Soft position: {self.last_selected_position}")
                 return True
+
+        selections = prediction.flatten()
+        selections = selections[selections >= 0]
+
+        if len(selections) > 0:
+            self.last_selected_key_idx = int(selections[-1])
+            self.decoding_event_seen = True
+            logger.info(f"[CHECK] Speller received class {self.last_selected_key_idx}.")
+            logger.debug(f"Selection: {self.last_selected_key_idx}, {selections=}")
+            return True
+
+        return False
+
+    def drain_decoder_stream(self) -> int:
+        """Clear old decoder samples so they cannot be used for the next trial."""
+
+        if self.decoder_inlet is None:
+            return 0
+
+        n_drained = 0
+        for _ in range(128):
+            sample, _ = self.decoder_inlet.pull_sample(timeout=0.0)
+            if sample is None:
+                break
+            n_drained += 1
+
+        return n_drained
+
+    def wait_for_decoding_event(self, duration: float) -> bool:
+        """Wait a little longer for decoder output after stimulation stops."""
+
+        if self.decoder_inlet is None or duration <= 0:
+            return False
+
+        n_frames = int(duration * self.refresh_rate)
+        for i in range(n_frames):
+            if i % 60 == 0 and len(event.getKeys(keyList=self.quit_controls)) > 0:
+                self.quit()
+                return False
+
+            if self.has_decoding_event():
+                self.handle_decoding_event()
+                return True
+
+            self.window.flip()
 
         return False
 
@@ -509,6 +548,7 @@ class Speller(object):
             x_pos, y_pos = self.last_selected_position
             position_text = f"({x_pos:.3f}, {y_pos:.3f})"
             self.set_text_field(name="text", text=position_text)
+            logger.info(f"[CHECK] Speller showing coordinate {position_text}.")
             logger.debug(f"Feedback: soft_position={position_text}")
             self.run(
                 sequences=self.highlights,
@@ -861,7 +901,7 @@ def setup_speller(cfg: dict) -> Speller:
         size=(x_size, y_size),
         pos=(x_pos, y_pos),
         background_color=cfg["speller"]["text_fields"]["background_color"],
-        text_color=(-1.0, -1.0, -1.0),
+        text_color=(1.0, 1.0, 1.0),
     )
 
     # using the positions of the text field with an offset, add a text field for the autocompletion results
@@ -890,6 +930,7 @@ def setup_speller(cfg: dict) -> Speller:
         ),
         pos=(x_pos, y_pos),
         background_color=cfg["speller"]["text_fields"]["background_color"],
+        text_color=(1.0, 1.0, 1.0),
         alignment="center",
     )
 
@@ -1122,12 +1163,34 @@ def run_speller_paradigm(
 
         # Trial
         logger.info("Starting stimulation")
+        if phase == "online":
+            speller.decoding_event_seen = False
+            n_drained = speller.drain_decoder_stream()
+            if n_drained > 0:
+                logger.info(
+                    f"[CHECK] Cleared {n_drained} stale decoder sample(s) before trial "
+                    f"{1 + i_trial}/{n_trials}."
+                )
+            logger.info(
+                f"[CHECK] Trial {1 + i_trial}/{n_trials}: flashing, waiting for decoder output."
+            )
         speller.run(
             sequences=key_to_sequence,
             duration=cfg["speller"]["timing"]["trial_s"],
             start_marker=f"{cfg['speller']['markers']['trial_start']}",
             stop_marker=cfg["speller"]["markers"]["trial_stop"],
         )
+        if phase == "online" and not speller.decoding_event_seen:
+            decoder_wait_s = cfg["speller"]["timing"].get("decoder_wait_s", 2.0)
+            logger.info(
+                f"[CHECK] Trial {1 + i_trial}/{n_trials}: waiting {decoder_wait_s:.1f}s "
+                "after flashing for decoder output."
+            )
+            speller.wait_for_decoding_event(duration=decoder_wait_s)
+            if not speller.decoding_event_seen:
+                logger.info(
+                    f"[CHECK] Trial {1 + i_trial}/{n_trials}: no decoder output received."
+                )
 
         # Inter-trial time
         logger.info("Inter-trial interval")

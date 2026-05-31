@@ -19,7 +19,7 @@ decoder_stream_name = "cvep-decoder-stream"
 
 [training]
 codes_file = "mgold_61_6521.npz"
-n_trials = 12
+n_trials = 8
 
 [online]
 codes_file = "mgold_61_6521.npz"
@@ -37,6 +37,7 @@ full_screen = false
 [speller.timing]
 cue_s = 0.7
 trial_s = 4.2
+decoder_wait_s = 2.0
 feedback_s = 0.7
 iti_s = 0.3
 stop_s = 5.0
