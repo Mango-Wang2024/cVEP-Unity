@@ -110,6 +110,7 @@ class OnlineDecoder:
         self.classifier_input_sfreq = None
         self.last_soft_position: NDArray | None = None
         self.last_insufficient_log_time: float = 0.0
+        self.max_marker_drain_samples: int = 10000
 
     # -------- Connection and initialization methods --------------------------
     def load_model(
@@ -158,7 +159,12 @@ class OnlineDecoder:
             logger.error("The marker stream should have exactly one channel.")
             return 1
 
-        self.marker_inlet = pylsl.StreamInlet(streams[0])
+        self.marker_inlet = pylsl.StreamInlet(
+            streams[0],
+            max_buflen=1,
+            max_chunklen=1,
+            recover=True,
+        )
 
         return 0
 
@@ -243,6 +249,7 @@ class OnlineDecoder:
 
     def run(self) -> tuple[threading.Thread, threading.Event]:
         logger.info("[CHECK] DECODE ONLINE pressed: decoder run loop starting.")
+        self.drain_marker_stream(reason="before decoder run loop")
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._run_loop,
@@ -251,6 +258,30 @@ class OnlineDecoder:
         thread.start()
         logger.debug("Started the run loop")
         return thread, stop_event
+
+    def drain_marker_stream(self, reason: str = "") -> int:
+        """Remove queued marker samples so decoding starts from fresh markers."""
+
+        if self.marker_inlet is None:
+            return 0
+
+        n_drained = 0
+        while n_drained < self.max_marker_drain_samples:
+            sample, _ = self.marker_inlet.pull_sample(timeout=0.0)
+            if sample is None:
+                break
+            n_drained += 1
+
+        if n_drained > 0 or reason:
+            suffix = f" {reason}" if reason else ""
+            logger.info(f"[CHECK] Drained {n_drained} old marker samples{suffix}.")
+        if n_drained >= self.max_marker_drain_samples:
+            logger.warning(
+                "[CHECK] Marker stream still had queued samples after draining "
+                f"{self.max_marker_drain_samples}; marker production may be too fast."
+            )
+
+        return n_drained
 
     def update(self):
         logger.debug(f"Updating the decoder - {self.is_decoding=}")
@@ -281,42 +312,63 @@ class OnlineDecoder:
 
         markers = []
         markers_t = []
-        for _ in range(128):
+
+        sample, timestamp = self.marker_inlet.pull_sample(timeout=self.t_sleep_s)
+        if sample is None:
+            return
+        markers.append(sample[0])
+        markers_t.append(timestamp)
+
+        for _ in range(self.max_marker_drain_samples - 1):
             sample, timestamp = self.marker_inlet.pull_sample(timeout=0.0)
             if sample is None:
                 break
             markers.append(sample[0])
             markers_t.append(timestamp)
 
+        if len(markers) >= self.max_marker_drain_samples:
+            logger.warning(
+                "[CHECK] Marker update hit the drain limit. The decoder may still lag "
+                "behind the marker stream."
+            )
+
         if len(markers) > 0:
             markers = np.asarray(markers)
             markers_t = np.asarray(markers_t)
 
             if self.start_eval_marker in markers:
-                logger.info(f"[CHECK] Received marker '{self.start_eval_marker}': decoding started.")
-                self.is_decoding = True
-                self.internal_decoding_start_time = time.time()
-
                 # get time stamp of start_eval_marker --> consider inputs for epoch from this onwards
                 idx = np.where(markers == self.start_eval_marker)[0]
                 marker_lsl_time = float(markers_t[idx[-1]])
-                marker_time = marker_lsl_time
                 eeg_times = self.input_sw.unfold_buffer_t()
-                if len(eeg_times) > 0 and not (eeg_times[0] <= marker_time <= eeg_times[-1]):
-                    marker_age_s = max(0.0, pylsl.local_clock() - marker_lsl_time)
-                    fallback_latency_s = min(max(2 * self.t_sleep_s, 0.1), 0.25)
-                    converted_marker_time = float(eeg_times[-1]) - fallback_latency_s
-                    clipped_marker_time = float(
-                        np.clip(converted_marker_time, eeg_times[0], eeg_times[-1])
+                if len(eeg_times) == 0:
+                    logger.warning(
+                        f"[CHECK] Ignored marker '{self.start_eval_marker}' because the EEG buffer is empty."
                     )
-                    logger.info(
-                        "[CHECK] Marker timestamp is outside current EEG buffer "
-                        f"(marker={marker_lsl_time:.3f}, eeg_start={eeg_times[0]:.3f}, "
-                        f"eeg_end={eeg_times[-1]:.3f}, marker_age={marker_age_s:.3f}s); "
-                        f"using latest EEG time minus {fallback_latency_s:.3f}s: "
-                        f"{clipped_marker_time:.3f}."
+                    return
+
+                # OpenBCI GUI timestamps EEG in a different absolute clock than LSL markers.
+                # Estimate the current offset and convert the marker to the EEG timebase.
+                marker_age_s = max(0.0, pylsl.local_clock() - marker_lsl_time)
+                eeg_clock_offset = float(eeg_times[-1]) - pylsl.local_clock()
+                marker_time = marker_lsl_time + eeg_clock_offset
+
+                if not (eeg_times[0] <= marker_time <= eeg_times[-1]):
+                    logger.warning(
+                        f"[CHECK] Ignored stale marker '{self.start_eval_marker}' "
+                        f"with marker_age={marker_age_s:.3f}s because converted marker time "
+                        f"{marker_time:.3f} is outside EEG buffer "
+                        f"[{eeg_times[0]:.3f}, {eeg_times[-1]:.3f}]. No decoding started."
                     )
-                    marker_time = clipped_marker_time
+                    return
+
+                logger.info(
+                    f"[CHECK] Received marker '{self.start_eval_marker}' with marker_age={marker_age_s:.3f}s; "
+                    f"converted to EEG time {marker_time:.3f}: decoding started."
+                )
+                self.is_decoding = True
+                self.internal_decoding_start_time = time.time()
+
                 self.start_eval_time = marker_time
 
     def _filter(self):
@@ -396,7 +448,10 @@ class OnlineDecoder:
         else:
             logger.debug(f"Classifying epoch of shape {x.shape} (n_trials x n_channels x n_samples).")
             y = self.classifier.predict(x)[0]   #predicts the selected key
-            logger.info(f"[CHECK] Decoder classified with prediction {y}.")
+            if y >= 0:
+                logger.info(f"[CHECK] Decoder classified with prediction {y}.")
+            else:
+                logger.debug(f"Decoder classified with prediction {y}.")
 
         # If y=-1 then the classifier is not yet sufficiently certain to emit the classification
         if y >= 0:

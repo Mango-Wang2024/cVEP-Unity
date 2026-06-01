@@ -143,7 +143,7 @@ def create_classifier(
             int(cmeta.sfreq / cmeta.presentation_rate),
             axis=1,
         )
-        logger.info("Creating zero-training decoder without calibration data.")
+        logger.info("[CHECK] Creating zero-training decoder without calibration data.")
         logger.debug(f"The stimuli V are of shape: {V.shape} (codes x samples)")
 
         model = get_zero_training_model(cmeta, V)
@@ -413,14 +413,14 @@ def save_classifier_outputs(
     out_file = cfg["decoder"]["decoder_file"]
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, out_file)
-    logger.info(f"Classifier saved to {out_file}")
+    logger.info(f"[CHECK] Classifier saved to {out_file}")
 
     # Save classifier meta
     out_file_meta = cfg["decoder"]["decoder_meta_file"]
     Path(out_file_meta).parent.mkdir(parents=True, exist_ok=True)
     with open(out_file_meta, "w") as fid:
         json.dump(asdict(cmeta), fid)
-        logger.info(f"Classifier meta data saved to {out_file_meta}")
+        logger.info(f"[CHECK] Classifier meta data saved to {out_file_meta}")
 
     # Save the optimal subset and layout
     json_data = {
@@ -432,7 +432,7 @@ def save_classifier_outputs(
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, "w") as fid:
         json.dump(json_data, fid)
-        logger.info(f"Subset and layout saved to {out_file}")
+        logger.info(f"[CHECK] Subset and layout saved to {out_file}")
 
 
 def get_rcca_model_early_stop(
