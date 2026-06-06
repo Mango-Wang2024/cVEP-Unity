@@ -15,15 +15,28 @@ decoder_subset_layout_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decode
 
 [streams]
 marker_stream_name = "cvep-speller-stream"
+marker_udp_host = "127.0.0.1"
+marker_udp_port = 9099
+decoder_output_udp_host = "127.0.0.1"
+decoder_output_udp_port = 9100
 decoder_stream_name = "cvep-decoder-stream"
 
 [training]
 codes_file = "mgold_61_6521.npz"
-n_trials = 8
+n_trials = 12
 
 [online]
 codes_file = "mgold_61_6521.npz"
 n_trials = 10
+
+[online_accuracy]
+enabled = true
+true_targets = [ "1", "1", "1", "1", "1", "1", "1", "1", "1", "1",]
+decoder_config_file = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder.toml"
+output_dir = "/Users/wang/dp-cvep-1/cvep_speller_env/data/online_accuracy"
+mode_label = ""
+open_after_save = true
+plot_delay_s = 3.0
 
 [speller.screen]
 id = 0
@@ -37,7 +50,9 @@ full_screen = false
 [speller.timing]
 cue_s = 0.7
 trial_s = 4.2
+decoder_arm_wait_s = 1.0
 decoder_wait_s = 2.0
+decoder_emergency_wait_s = 0.0
 feedback_s = 0.7
 iti_s = 0.3
 stop_s = 5.0

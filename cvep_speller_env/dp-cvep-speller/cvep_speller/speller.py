@@ -1,6 +1,8 @@
 import json
 import os
 import random
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -18,6 +20,8 @@ from psychopy import event, misc, monitors, visual
 from pylsl import StreamInfo, StreamInlet, StreamOutlet, resolve_byprop
 
 from cvep_speller.utils.logging import logger
+
+REALTIME_UDP_FIX_VERSION = "udp-speller-v7-main-thread-udp-polling"
 
 # Windows does not allow / , : * ? " < > | ~ in file names (for the images)
 KEY_MAPPING = {
@@ -117,23 +121,45 @@ class Speller(object):
         )
         self.window.setMouseVisible(False)
 
-        # Setup LSL stream
-        info = StreamInfo(
-            name=marker_stream_name,
-            type="Markers",
-            channel_count=1,
-            nominal_srate=0,
-            channel_format="string",
-            source_id=marker_stream_name,
-        )
-        self.outlet = StreamOutlet(info)
+        self.marker_stream_name = marker_stream_name
+        self.outlet = None
+        self.decoder_marker_udp_host = cfg["streams"].get("marker_udp_host", "127.0.0.1")
+        self.decoder_marker_udp_port = cfg["streams"].get("marker_udp_port", None)
+        self.decoder_marker_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.decoder_output_udp_host = cfg["streams"].get("decoder_output_udp_host", "127.0.0.1")
+        self.decoder_output_udp_port = cfg["streams"].get("decoder_output_udp_port", None)
+        self.decoder_output_socket = None
+        self.decoder_output_stop_event = None
+        self.decoder_output_thread = None
+        self.decoder_output_lock = threading.Lock()
+        self.pending_decoder_arms: set[int] = set()
+        self.pending_decoder_outputs: dict[int, str] = {}
+        if self.decoder_output_udp_port is not None:
+            self.decoder_output_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.decoder_output_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.decoder_output_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_048_576)
+            self.decoder_output_socket.bind((self.decoder_output_udp_host, self.decoder_output_udp_port))
+            self.decoder_output_socket.setblocking(False)
+            self.decoder_output_stop_event = threading.Event()
+            logger.info(
+                f"[CHECK] UDP decoder output main-thread listener ready on "
+                f"{self.decoder_output_udp_host}:{self.decoder_output_udp_port}."
+            )
+            logger.info(
+                f"[CHECK] Real-time UDP fix active: {REALTIME_UDP_FIX_VERSION}."
+            )
 
         self.last_selected_key_idx: int | None = None
         self.last_selected_position: tuple[float, float] | None = None
+        self.last_selected_label: str | None = None
+        self.online_accuracy_rows: list[dict] = []
         self.key_map: dict[int, str] = {}
         self.highlights: dict = {}
         self.decoder_inlet = None
         self.decoding_event_seen = False
+        self.current_trial_id: int | None = None
+        self.accept_decoder_output = False
+        self.skip_next_udp_trial_start = False
 
         # Set up variables for text to speech, autocompletion, and shifting keyboard layout
         self.sample_idx = 0  # used to iterate through sample symbols, iterated in handle_decoding_event
@@ -286,6 +312,20 @@ class Speller(object):
         self.decoder_inlet = StreamInlet(streams[0])
         logger.info(f'[CHECK] Decoder stream "{name}" connected.')
 
+    def create_marker_lsl_stream(self) -> None:
+        if self.outlet is not None:
+            return
+        info = StreamInfo(
+            name=self.marker_stream_name,
+            type="Markers",
+            channel_count=1,
+            nominal_srate=0,
+            channel_format="string",
+            source_id=self.marker_stream_name,
+        )
+        self.outlet = StreamOutlet(info)
+        logger.info(f'[CHECK] Marker stream "{self.marker_stream_name}" created.')
+
     def get_pixels_per_degree(
         self,
     ) -> float:
@@ -357,10 +397,71 @@ class Speller(object):
         on_flip: bool (default: False)
             Whether to log on the next frame flip.
         """
+        if self.outlet is None:
+            raise RuntimeError("Marker stream has not been created yet.")
         if on_flip:
             self.window.callOnFlip(self.outlet.push_sample, [marker])
         else:
+            self.send_decoder_marker(marker)
             self.outlet.push_sample([marker])
+
+    def send_decoder_marker(self, marker: str) -> None:
+        if self.decoder_marker_udp_port is None:
+            return
+        if marker != self.cfg["speller"]["markers"]["trial_start"]:
+            return
+        if self.skip_next_udp_trial_start:
+            self.skip_next_udp_trial_start = False
+            logger.info(
+                f'[CHECK] Skipped duplicate UDP marker "{marker}" because '
+                f"trial {self.current_trial_id} was already armed."
+            )
+            return
+        if self.current_trial_id is None:
+            logger.warning(
+                f'[CHECK] Not sending UDP marker "{marker}" because no online trial id is active.'
+            )
+            return
+        payload = f"{marker}:{self.current_trial_id}:{time.time():.6f}"
+        try:
+            self.decoder_marker_socket.sendto(
+                payload.encode("utf-8"),
+                (self.decoder_marker_udp_host, int(self.decoder_marker_udp_port)),
+            )
+        except OSError as err:
+            logger.error(
+                f'[CHECK] Failed to send UDP marker "{payload}" to '
+                f"{self.decoder_marker_udp_host}:{self.decoder_marker_udp_port}: {err}."
+            )
+            raise
+        logger.info(
+            f'[CHECK] Sent UDP marker "{payload}" to '
+            f"{self.decoder_marker_udp_host}:{self.decoder_marker_udp_port}."
+        )
+
+    def request_decoder_force_decision(self) -> None:
+        if self.decoder_marker_udp_port is None:
+            return
+        if self.current_trial_id is None:
+            logger.warning("[CHECK] Not sending force_decision because no online trial id is active.")
+            return
+
+        marker = f"force_decision:{self.current_trial_id}:{time.time():.6f}"
+        try:
+            self.decoder_marker_socket.sendto(
+                marker.encode("utf-8"),
+                (self.decoder_marker_udp_host, int(self.decoder_marker_udp_port)),
+            )
+        except OSError as err:
+            logger.error(
+                f'[CHECK] Failed to send UDP marker "{marker}" to '
+                f"{self.decoder_marker_udp_host}:{self.decoder_marker_udp_port}: {err}."
+            )
+            raise
+        logger.info(
+            f'[CHECK] Sent UDP marker "{marker}" to '
+            f"{self.decoder_marker_udp_host}:{self.decoder_marker_udp_port}."
+        )
 
     def run(
         self,
@@ -368,6 +469,8 @@ class Speller(object):
         duration: float = None,
         start_marker: str = None,
         stop_marker: str = None,
+        start_marker_on_flip: bool = True,
+        check_decoder_output: bool = True,
     ) -> None:
         """
         Run a stimulation phase of the speller, which makes the keys flash according to specific sequences.
@@ -383,6 +486,8 @@ class Speller(object):
             The marker to log when stimulation starts. If None, no marker is logged.
         stop_marker: str (default: None)
             The marker to log when stimulation stops. If None, no marker is logged.
+        start_marker_on_flip: bool (default: True)
+            Whether to send the start marker on the next frame flip.
         """
 
         # Set number of frames
@@ -401,7 +506,11 @@ class Speller(object):
 
         # Send start marker
         if start_marker is not None:
-            self.log(start_marker, on_flip=True)
+            self.log(start_marker, on_flip=start_marker_on_flip)
+            logger.info(
+                f'[CHECK] Sent marker "{start_marker}" '
+                f"(on_flip={start_marker_on_flip})."
+            )
 
         # Loop frame flips
         for i in range(n_frames):
@@ -414,7 +523,13 @@ class Speller(object):
                     break
 
             # Check selection marker
-            if self.decoder_inlet is not None:
+            if (
+                    check_decoder_output
+                    and (
+                        self.decoder_inlet is not None
+                        or self.decoder_output_socket is not None
+                    )
+            ):
                 if self.has_decoding_event():
                     self.handle_decoding_event()
                     break
@@ -466,6 +581,11 @@ class Speller(object):
         """
         Check if the LSL stream contained a `speller_select <key_idx>` marker.
         """
+        if self.decoding_event_seen or not self.accept_decoder_output:
+            return False
+
+        if self.decoder_output_socket is not None and self.has_udp_decoding_event():
+            return True
 
         if self.decoder_inlet is None:
             return False
@@ -489,7 +609,10 @@ class Speller(object):
                 self.last_selected_key_idx = None
                 self.last_selected_position = (float(x_pos), float(y_pos))
                 self.decoding_event_seen = True
-                logger.info(f"[CHECK] Speller received coordinate ({x_pos:.3f}, {y_pos:.3f}).")
+                logger.info(
+                    f"[CHECK] Trial {self.current_trial_id}: speller received "
+                    f"LSL fallback coordinate ({x_pos:.3f}, {y_pos:.3f})."
+                )
                 logger.debug(f"Soft position: {self.last_selected_position}")
                 return True
 
@@ -499,17 +622,179 @@ class Speller(object):
         if len(selections) > 0:
             self.last_selected_key_idx = int(selections[-1])
             self.decoding_event_seen = True
-            logger.info(f"[CHECK] Speller received class {self.last_selected_key_idx}.")
+            logger.info(
+                f"[CHECK] Trial {self.current_trial_id}: speller received "
+                f"LSL fallback class {self.last_selected_key_idx}."
+            )
             logger.debug(f"Selection: {self.last_selected_key_idx}, {selections=}")
             return True
 
+        return False
+
+    def _decoder_output_loop(self) -> None:
+        while (
+                self.decoder_output_socket is not None
+                and self.decoder_output_stop_event is not None
+                and not self.decoder_output_stop_event.is_set()
+        ):
+            try:
+                data, _ = self.decoder_output_socket.recvfrom(2048)
+            except (BlockingIOError, socket.timeout):
+                time.sleep(0.001)
+                continue
+            except OSError as err:
+                if not self.decoder_output_stop_event.is_set():
+                    logger.warning(f"[CHECK] UDP decoder output listener stopped/read failed: {err}")
+                break
+
+            payload = data.decode("utf-8", errors="replace").strip()
+            self._store_udp_decoder_payload(payload)
+
+    def poll_udp_decoder_outputs(self, max_packets: int = 128) -> int:
+        if self.decoder_output_socket is None:
+            return 0
+
+        n_packets = 0
+        for _ in range(max_packets):
+            try:
+                data, _ = self.decoder_output_socket.recvfrom(2048)
+            except BlockingIOError:
+                break
+            except OSError as err:
+                logger.warning(f"[CHECK] UDP decoder output polling failed: {err}")
+                break
+
+            payload = data.decode("utf-8", errors="replace").strip()
+            self._store_udp_decoder_payload(payload)
+            n_packets += 1
+
+        return n_packets
+
+    def _store_udp_decoder_payload(self, payload: str) -> None:
+        parts = payload.split(":")
+        if len(parts) >= 2 and parts[0] == "armed":
+            try:
+                trial_id = int(parts[1])
+            except ValueError:
+                logger.warning(f"[CHECK] Ignored malformed decoder arm response: {payload}")
+                return
+            with self.decoder_output_lock:
+                self.pending_decoder_arms.add(trial_id)
+            if trial_id == self.current_trial_id:
+                logger.info(f"[CHECK] Trial {trial_id}: stored UDP decoder arm response.")
+            return
+
+        if len(parts) < 3 or parts[0] not in {"class", "coordinate"}:
+            logger.warning(f"[CHECK] Ignored malformed UDP decoder output: {payload}")
+            return
+
+        try:
+            trial_id = int(parts[1])
+        except ValueError:
+            logger.warning(f"[CHECK] Ignored UDP decoder output with bad trial id: {payload}")
+            return
+
+        with self.decoder_output_lock:
+            self.pending_decoder_outputs[trial_id] = payload
+        if trial_id == self.current_trial_id:
+            logger.info(f"[CHECK] Trial {trial_id}: stored UDP decoder output {payload}.")
+        else:
+            logger.info(
+                f"[CHECK] Stored UDP decoder output {payload}; current trial is "
+                f"{self.current_trial_id}."
+            )
+
+    def has_udp_decoding_event(self) -> bool:
+        if self.decoder_output_socket is None:
+            return False
+
+        self.poll_udp_decoder_outputs()
+
+        with self.decoder_output_lock:
+            accepted_payload = self.pending_decoder_outputs.pop(
+                self.current_trial_id,
+                None,
+            )
+
+        if accepted_payload is None:
+            return False
+
+        parts = accepted_payload.split(":", 2)
+        kind = parts[0]
+        value = parts[2]
+
+        if kind == "class":
+            try:
+                self.last_selected_key_idx = int(value)
+            except ValueError:
+                logger.warning(f"[CHECK] Ignored malformed UDP decoder class: {accepted_payload}")
+                return False
+            self.last_selected_position = None
+            self.decoding_event_seen = True
+            logger.info(
+                f"[CHECK] Trial {self.current_trial_id}: speller received UDP class "
+                f"{self.last_selected_key_idx}."
+            )
+            return True
+
+        if kind == "coordinate":
+            try:
+                x_text, y_text = value.split(",", 1)
+                x_pos = float(x_text)
+                y_pos = float(y_text)
+            except ValueError:
+                logger.warning(f"[CHECK] Ignored malformed UDP decoder coordinate: {accepted_payload}")
+                return False
+            self.last_selected_key_idx = None
+            self.last_selected_position = (x_pos, y_pos)
+            self.decoding_event_seen = True
+            logger.info(
+                f"[CHECK] Trial {self.current_trial_id}: speller received UDP coordinate "
+                f"({x_pos:.3f}, {y_pos:.3f})."
+            )
+            return True
+
+        return False
+
+    def wait_for_decoder_arm(self, duration: float, retry_marker: str | None = None) -> bool:
+        if duration <= 0 or self.decoder_output_socket is None:
+            return True
+
+        deadline = time.time() + duration
+        next_retry_time = time.time() + 1.0
+        while time.time() < deadline:
+            self.poll_udp_decoder_outputs()
+            with self.decoder_output_lock:
+                if self.current_trial_id in self.pending_decoder_arms:
+                    self.pending_decoder_arms.remove(self.current_trial_id)
+                    logger.info(f"[CHECK] Trial {self.current_trial_id}: decoder armed before flashing.")
+                    return True
+                if self.current_trial_id in self.pending_decoder_outputs:
+                    logger.info(
+                        f"[CHECK] Trial {self.current_trial_id}: decoder output arrived "
+                        "before arm wait ended; treating decoder as ready."
+                    )
+                    return True
+
+            if retry_marker is not None and time.time() >= next_retry_time:
+                logger.info(
+                    f"[CHECK] Trial {self.current_trial_id}: retrying decoder arm marker."
+                )
+                self.send_decoder_marker(retry_marker)
+                next_retry_time = time.time() + 1.0
+            self.window.flip()
+
+        logger.error(
+            f"[CHECK] Trial {self.current_trial_id}: decoder did not arm within "
+            f"{duration:.1f}s; skipping useful flashing would be safer."
+        )
         return False
 
     def drain_decoder_stream(self) -> int:
         """Clear old decoder samples so they cannot be used for the next trial."""
 
         if self.decoder_inlet is None:
-            return 0
+            return self.drain_udp_decoder_outputs()
 
         n_drained = 0
         for _ in range(128):
@@ -518,17 +803,41 @@ class Speller(object):
                 break
             n_drained += 1
 
-        return n_drained
+        return n_drained + self.drain_udp_decoder_outputs()
 
-    def wait_for_decoding_event(self, duration: float) -> bool:
+    def drain_udp_decoder_outputs(self) -> int:
+        self.poll_udp_decoder_outputs()
+
+        with self.decoder_output_lock:
+            stale_output_trials = [
+                trial_id
+                for trial_id in self.pending_decoder_outputs
+                if trial_id != self.current_trial_id
+            ]
+            stale_arm_trials = [
+                trial_id
+                for trial_id in self.pending_decoder_arms
+                if trial_id != self.current_trial_id
+            ]
+            for trial_id in stale_output_trials:
+                self.pending_decoder_outputs.pop(trial_id, None)
+            for trial_id in stale_arm_trials:
+                self.pending_decoder_arms.discard(trial_id)
+
+        return len(stale_output_trials) + len(stale_arm_trials)
+
+    def wait_for_decoding_event(self, duration: float, retry_force_decision: bool = False) -> bool:
         """Wait a little longer for decoder output after stimulation stops."""
 
-        if self.decoder_inlet is None or duration <= 0:
+        if duration <= 0:
             return False
 
-        n_frames = int(duration * self.refresh_rate)
-        for i in range(n_frames):
-            if i % 60 == 0 and len(event.getKeys(keyList=self.quit_controls)) > 0:
+        if self.decoder_inlet is None and self.decoder_output_socket is None:
+            return False
+
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            if len(event.getKeys(keyList=self.quit_controls)) > 0:
                 self.quit()
                 return False
 
@@ -538,7 +847,157 @@ class Speller(object):
 
             self.window.flip()
 
+        if self.has_decoding_event():
+            logger.info(
+                f"[CHECK] Trial {self.current_trial_id}: decoder output arrived "
+                "at the timeout edge; accepting it before marking no-output."
+            )
+            self.handle_decoding_event()
+            return True
+
         return False
+
+    def get_online_accuracy_mode_label(self) -> str:
+        plot_cfg = self.cfg.get("online_accuracy", {})
+        configured_label = str(plot_cfg.get("mode_label", "")).strip()
+        if configured_label:
+            return configured_label
+
+        decoder_config_file = plot_cfg.get(
+            "decoder_config_file",
+            "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder.toml",
+        )
+        try:
+            decoder_cfg = toml.load(decoder_config_file)
+            mode = decoder_cfg["decoder"].get("training_mode", "unknown").lower()
+        except Exception as err:
+            logger.warning(f"[CHECK] Could not read decoder mode for accuracy plot: {err}")
+            mode = "unknown"
+
+        mode_labels = {
+            "zero": "Zero-training",
+            "calibration": "Calibration",
+        }
+        return mode_labels.get(mode, mode.title())
+
+    def record_online_accuracy_trial(self, trial_id: int, true_target: str | None) -> None:
+        predicted_target = self.last_selected_label if self.decoding_event_seen else None
+        is_correct = (
+            true_target is not None
+            and predicted_target is not None
+            and str(true_target) == str(predicted_target)
+        )
+        self.online_accuracy_rows.append(
+            {
+                "trial": trial_id,
+                "mode": self.get_online_accuracy_mode_label(),
+                "true_target": true_target if true_target is not None else "",
+                "predicted_target": predicted_target if predicted_target is not None else "",
+                "correct": int(is_correct),
+            }
+        )
+        logger.info(
+            f"[CHECK] Accuracy trial {trial_id}: true={true_target}, "
+            f"predicted={predicted_target}, correct={is_correct}."
+        )
+
+    def save_online_accuracy_plot(self) -> None:
+        plot_cfg = self.cfg.get("online_accuracy", {})
+        if not plot_cfg.get("enabled", False):
+            return
+        if len(self.online_accuracy_rows) == 0:
+            logger.warning("[CHECK] No online accuracy rows available; no accuracy plot saved.")
+            return
+
+        output_dir = Path(
+            plot_cfg.get(
+                "output_dir",
+                "/Users/wang/dp-cvep-1/cvep_speller_env/data/online_accuracy",
+            )
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        mode_label = self.get_online_accuracy_mode_label()
+        mode_slug = mode_label.lower().replace("-", "_").replace(" ", "_")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        png_path = output_dir / f"online_accuracy_{mode_slug}_{timestamp}.png"
+
+        correct = sum(int(row["correct"]) for row in self.online_accuracy_rows)
+        n_trials = len(self.online_accuracy_rows)
+        accuracy = correct / n_trials if n_trials > 0 else 0.0
+
+        true_targets = [str(row["true_target"]) for row in self.online_accuracy_rows]
+        predicted_targets = [
+            str(row["predicted_target"]) if row["predicted_target"] != "" else "No output"
+            for row in self.online_accuracy_rows
+        ]
+        target_labels = list(dict.fromkeys(
+            [label for label in true_targets + predicted_targets if label != ""]
+        ))
+        target_labels = sorted(
+            target_labels,
+            key=lambda label: (
+                label == "No output",
+                0 if label.isdigit() else 1,
+                int(label) if label.isdigit() else label,
+            ),
+        )
+        label_to_y = {label: idx for idx, label in enumerate(target_labels)}
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plt.rcParams.update(
+            {
+                "font.size": 10,
+                "axes.spines.top": False,
+                "axes.spines.right": False,
+                "figure.dpi": 160,
+                "savefig.dpi": 300,
+            }
+        )
+
+        fig, ax_trial = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
+        trials = [int(row["trial"]) for row in self.online_accuracy_rows]
+        true_y = [label_to_y.get(label, np.nan) for label in true_targets]
+        pred_y = [label_to_y.get(label, np.nan) for label in predicted_targets]
+        correct_flags = [bool(int(row["correct"])) for row in self.online_accuracy_rows]
+
+        for trial, is_correct in zip(trials, correct_flags):
+            ax_trial.axvspan(
+                trial - 0.45,
+                trial + 0.45,
+                color=("#E5F4EA" if is_correct else "#FBE6E6"),
+                alpha=0.75,
+                linewidth=0,
+            )
+        ax_trial.plot(trials, true_y, "o-", color="#222222", label="True target", markersize=4)
+        ax_trial.plot(trials, pred_y, "x--", color="#D65F00", label="Predicted target", markersize=5)
+        ax_trial.set_yticks(range(len(target_labels)))
+        ax_trial.set_yticklabels(target_labels)
+        ax_trial.set_xlabel("Trial")
+        ax_trial.set_ylabel("Target")
+        ax_trial.set_title(
+            f"Online cVEP Speller Accuracy - {mode_label}\n"
+            f"Trial-by-Trial Prediction ({correct}/{n_trials}, {accuracy * 100:.1f}% correct)",
+            fontweight="bold",
+        )
+        ax_trial.set_xlim(0.5, max(trials) + 0.5)
+        ax_trial.legend(frameon=False, loc="upper right", fontsize=8)
+        ax_trial.grid(axis="y", color="#DDDDDD", linewidth=0.6)
+
+        fig.savefig(png_path, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.info(f"[CHECK] Saved online accuracy PNG: {png_path}")
+
+        if plot_cfg.get("open_after_save", True):
+            try:
+                subprocess.Popen(["open", str(png_path)])
+                logger.info(f"[CHECK] Opened online accuracy PNG: {png_path}")
+            except Exception as err:
+                logger.warning(f"[CHECK] Could not open online accuracy PNG automatically: {err}")
 
     def handle_decoding_event(self) -> None:
         # Decoding
@@ -547,6 +1006,7 @@ class Speller(object):
         if self.last_selected_key_idx is None and self.last_selected_position is not None:
             x_pos, y_pos = self.last_selected_position
             position_text = f"({x_pos:.3f}, {y_pos:.3f})"
+            self.last_selected_label = position_text
             self.set_text_field(name="text", text=position_text)
             logger.info(f"[CHECK] Speller showing coordinate {position_text}.")
             logger.debug(f"Feedback: soft_position={position_text}")
@@ -558,6 +1018,7 @@ class Speller(object):
                     f"x={x_pos:.6f};y={y_pos:.6f}"
                 ),
                 stop_marker=self.cfg["speller"]["markers"]["feedback_stop"],
+                check_decoder_output=False,
             )
             return
 
@@ -571,6 +1032,7 @@ class Speller(object):
             ]  # self.key_map[0] = tilde, for example
         else:
             prediction_key = self.all_keys[self.key_map[prediction]]
+        self.last_selected_label = str(self.key_map[prediction])
 
         logger.debug(
             f"Decoding: prediction={prediction} prediction_key={prediction_key}"
@@ -663,6 +1125,7 @@ class Speller(object):
             duration=self.cfg["speller"]["timing"]["feedback_s"],
             start_marker=f"{self.cfg['speller']['markers']['feedback_start']};label={prediction};key={prediction_key}",
             stop_marker=self.cfg["speller"]["markers"]["feedback_stop"],
+            check_decoder_output=False,
         )
 
         if self.cfg["speller"]["text2speech"]["enabled"]:
@@ -1098,9 +1561,11 @@ def run_speller_paradigm(
     """
     cfg = toml.load(config_path)
     speller = setup_speller(cfg)
+    logger.info(f'[CHECK] Speller setup complete for phase "{phase}".')
 
     if phase != "training":
         speller.connect_to_decoder_lsl_stream()
+    speller.create_marker_lsl_stream()
 
     key_to_sequence, code_to_key = create_key2seq_and_code2key(cfg, phase)
     speller.key_map = code_to_key
@@ -1130,6 +1595,11 @@ def run_speller_paradigm(
 
     # Loop trials
     n_trials = cfg[phase]["n_trials"]
+    completed_online_trials = 0
+    online_true_targets = [
+        str(target)
+        for target in cfg.get("online_accuracy", {}).get("true_targets", [])
+    ]
     training_targets = []
     if phase == "training":
         repeats, remainder = divmod(n_trials, n_classes)
@@ -1164,7 +1634,12 @@ def run_speller_paradigm(
         # Trial
         logger.info("Starting stimulation")
         if phase == "online":
+            speller.current_trial_id = i_trial + 1
+            speller.accept_decoder_output = True
             speller.decoding_event_seen = False
+            speller.last_selected_key_idx = None
+            speller.last_selected_position = None
+            speller.last_selected_label = None
             n_drained = speller.drain_decoder_stream()
             if n_drained > 0:
                 logger.info(
@@ -1172,25 +1647,76 @@ def run_speller_paradigm(
                     f"{1 + i_trial}/{n_trials}."
                 )
             logger.info(
-                f"[CHECK] Trial {1 + i_trial}/{n_trials}: flashing, waiting for decoder output."
+                f"[CHECK] Trial {speller.current_trial_id}/{n_trials}: arming decoder "
+                "before flashing."
             )
+            speller.send_decoder_marker(cfg["speller"]["markers"]["trial_start"])
+            decoder_arm_wait_s = cfg["speller"]["timing"].get("decoder_arm_wait_s", 2.0)
+            decoder_armed = speller.wait_for_decoder_arm(
+                    duration=decoder_arm_wait_s,
+                    retry_marker=cfg["speller"]["markers"]["trial_start"],
+            )
+            if decoder_armed:
+                speller.skip_next_udp_trial_start = True
+            else:
+                logger.warning(
+                    f"[CHECK] Trial {speller.current_trial_id}/{n_trials}: "
+                    "decoder arm acknowledgement was not received; continuing trial "
+                    "without a duplicate UDP start marker. The end-of-trial "
+                    "force_decision marker will request the real rCCA output."
+                )
+                speller.skip_next_udp_trial_start = True
         speller.run(
             sequences=key_to_sequence,
             duration=cfg["speller"]["timing"]["trial_s"],
             start_marker=f"{cfg['speller']['markers']['trial_start']}",
             stop_marker=cfg["speller"]["markers"]["trial_stop"],
+            start_marker_on_flip=phase != "online",
+            check_decoder_output=phase == "online",
         )
         if phase == "online" and not speller.decoding_event_seen:
+            speller.request_decoder_force_decision()
             decoder_wait_s = cfg["speller"]["timing"].get("decoder_wait_s", 2.0)
             logger.info(
-                f"[CHECK] Trial {1 + i_trial}/{n_trials}: waiting {decoder_wait_s:.1f}s "
-                "after flashing for decoder output."
+                f"[CHECK] Trial {speller.current_trial_id}/{n_trials}: waiting "
+                f"{decoder_wait_s:.1f}s after flashing for matching decoder output."
             )
-            speller.wait_for_decoding_event(duration=decoder_wait_s)
+            speller.wait_for_decoding_event(
+                duration=decoder_wait_s,
+                retry_force_decision=True,
+            )
             if not speller.decoding_event_seen:
-                logger.info(
-                    f"[CHECK] Trial {1 + i_trial}/{n_trials}: no decoder output received."
+                emergency_wait_s = cfg["speller"]["timing"].get(
+                    "decoder_emergency_wait_s", 0.0
                 )
+                if emergency_wait_s > 0:
+                    logger.error(
+                        f"[CHECK] Trial {speller.current_trial_id}/{n_trials}: "
+                        "no matching rCCA decoder output received during normal wait; "
+                        "continuing to request a real rCCA decision before ending this trial."
+                    )
+                    speller.wait_for_decoding_event(
+                        duration=emergency_wait_s,
+                        retry_force_decision=True,
+                    )
+            if not speller.decoding_event_seen:
+                logger.error(
+                    f"[CHECK] Trial {speller.current_trial_id}/{n_trials}: "
+                    f"no real rCCA decoder output within {decoder_wait_s:.1f}s; "
+                    "recording this trial as no-output and continuing."
+                )
+        if phase == "online":
+            true_target = (
+                online_true_targets[i_trial]
+                if i_trial < len(online_true_targets)
+                else None
+            )
+            speller.record_online_accuracy_trial(
+                trial_id=i_trial + 1,
+                true_target=true_target,
+            )
+            completed_online_trials += 1
+            speller.accept_decoder_output = False
 
         # Inter-trial time
         logger.info("Inter-trial interval")
@@ -1199,12 +1725,36 @@ def run_speller_paradigm(
             duration=cfg["speller"]["timing"]["iti_s"],
             start_marker=f"{cfg['speller']['markers']['iti_start']}",
             stop_marker=cfg["speller"]["markers"]["iti_stop"],
+            check_decoder_output=False,
         )
+        if phase == "online":
+            speller.current_trial_id = None
 
         if phase == "online" and speller.get_text_field("text").endswith(
             cfg["speller"]["quit_phrase"]
         ):
             break
+
+    if phase == "online" and completed_online_trials == n_trials:
+        plot_delay_s = float(cfg.get("online_accuracy", {}).get("plot_delay_s", 0.0))
+        if plot_delay_s > 0:
+            logger.info(
+                f"[CHECK] Waiting {plot_delay_s:.1f}s before opening online accuracy plot "
+                "so final trial feedback remains visible."
+            )
+            delay_deadline = time.time() + plot_delay_s
+            while time.time() < delay_deadline:
+                if len(event.getKeys(keyList=cfg["speller"]["controls"]["quit"])) > 0:
+                    speller.quit()
+                    return
+                speller.window.flip()
+                time.sleep(1.0 / max(float(speller.refresh_rate), 1.0))
+        speller.save_online_accuracy_plot()
+    elif phase == "online":
+        logger.warning(
+            f"[CHECK] Online run ended after {completed_online_trials}/{n_trials} "
+            "trials; final accuracy plot was not saved because the full run did not finish."
+        )
 
     # Wait to stop
     logger.info("Waiting for button press to stop")
