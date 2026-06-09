@@ -4,7 +4,7 @@ marker_stream_name = "cvep-speller-stream"
 marker_udp_host = "127.0.0.1"
 marker_udp_port = 9099
 decoder_output_udp_host = "127.0.0.1"
-decoder_output_udp_port = 9100
+decoder_output_udp_port = 9101
 decoder_stream_name = "cvep-decoder-stream"
 buffer_size_s = 15.0
 padding_size_s = 0.5
@@ -28,7 +28,7 @@ target_freq_hz = 60
 passband_hz = [ 6, 40,]
 
 [decoder]
-training_mode = "zero"
+training_mode = "calibration"
 decoder_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder.joblib"
 decoder_meta_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_meta.json"
 decoder_subset_layout_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_subset_layout.json"
