@@ -13,7 +13,7 @@ padding_size_s = 0.5
 presentation_rate_hz = 60
 cue_marker = "start_cue"
 trial_marker = "start_trial"
-n_keys = 4
+n_keys = 16
 tmin_s = 0.0
 tmax_s = 4.2
 
@@ -43,6 +43,7 @@ min_time_s = 3.5
 max_time_s = 4.0
 cr = 1.0
 trained = false
+optimize_subset = false
 soft_decision_enabled = false
 soft_decision_smoothing = 0.5
 soft_decision_min_confidence = 0.0

@@ -313,12 +313,14 @@ def select_codes_and_layout(
 ) -> tuple[NDArray, NDArray]:
     # Optimize subset of codes
     n_keys = cfg["stimulus"]["n_keys"]
-    if n_keys != 0 and n_keys < V.shape[0]:
+    optimize_subset = cfg["decoder"].get("optimize_subset", True)
+    if optimize_subset and n_keys != 0 and n_keys < V.shape[0]:
         subset = pyntbci.stimulus.optimize_subset_clustering(model.estimator.Ts_[:, 0, :], n_keys)
         logger.debug(f"Created optimal subset for {n_keys} keys using {len(model.estimator.Ts_)} codes")
     else:
-        subset = np.array([i for i in range(n_keys)])  # Mockup "subset" which is just the 0:n_keys-1.
-        logger.debug("Skipped optimal subset (Number of keys equals number of codes or Number of keys is set to 0)")
+        n_selected = n_keys if n_keys != 0 else V.shape[0]
+        subset = np.array([i for i in range(n_selected)])  # Mockup "subset" which is just the 0:n_keys-1.
+        logger.debug("Skipped optimal subset")
     V = V[subset, :]  # select optimal code subset
     model.estimator.set_stimulus(V)
 

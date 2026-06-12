@@ -1600,19 +1600,12 @@ def run_speller_paradigm(
         str(target)
         for target in cfg.get("online_accuracy", {}).get("true_targets", [])
     ]
-    training_targets = []
-    if phase == "training":
-        repeats, remainder = divmod(n_trials, n_classes)
-        training_targets = list(range(n_classes)) * repeats
-        training_targets += random.sample(range(n_classes), remainder)
-        random.shuffle(training_targets)
-
     for i_trial in range(n_trials):
         logger.info(f"Initiating trial {1 + i_trial}/{n_trials}")
 
         if phase == "training":
-            # Set a balanced random target
-            target = training_targets[i_trial]
+            # Set a random target
+            target = random.randint(0, n_classes - 1)
             target_key = code_to_key[target]
 
             # Cue

@@ -23,7 +23,7 @@ decoder_stream_name = "cvep-decoder-stream"
 
 [training]
 codes_file = "mgold_61_6521.npz"
-n_trials = 12
+n_trials = 10
 
 [online]
 codes_file = "mgold_61_6521.npz"
@@ -69,8 +69,18 @@ width_dva = 3.0
 height_dva = 3.0
 space_dva = 0.5
 colors = [ "black", "white", "green", "blue",]
-keys_upper = [ [ "1", "2" ], [ "3", "4" ] ]
-keys_lower = [ [ "1", "2" ], [ "3", "4" ] ]
+keys_upper = [
+    [ "1", "2", "3", "4" ],
+    [ "5", "6", "7", "8" ],
+    [ "9", "10", "11", "12" ],
+    [ "13", "14", "15", "16" ],
+]
+keys_lower = [
+    [ "1", "2", "3", "4" ],
+    [ "5", "6", "7", "8" ],
+    [ "9", "10", "11", "12" ],
+    [ "13", "14", "15", "16" ],
+]
 
 [speller.text_fields]
 height_dva = 2.3
