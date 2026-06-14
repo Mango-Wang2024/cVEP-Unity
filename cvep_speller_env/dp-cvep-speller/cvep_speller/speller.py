@@ -865,7 +865,7 @@ class Speller(object):
 
         decoder_config_file = plot_cfg.get(
             "decoder_config_file",
-            "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder.toml",
+            "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder_unity.toml",
         )
         try:
             decoder_cfg = toml.load(decoder_config_file)

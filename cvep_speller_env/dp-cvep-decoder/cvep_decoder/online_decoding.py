@@ -52,6 +52,9 @@ class OnlineDecoder:
     max_eval_time_s : float
         The maximum time to try decoding a trial. Default is 10s.
 
+    first_trial_max_eval_time_s : float | None
+        Optional longer maximum evaluation time for the first online trial.
+
     t_sleep_s : float
         Time to sleep between updates, defines the update frequency. Default is 0.1s.
 
@@ -75,6 +78,7 @@ class OnlineDecoder:
             padding_size_s: float,
             start_eval_marker: str,
             max_eval_time_s: float = 10,
+            first_trial_max_eval_time_s: float | None = None,
             t_sleep_s: float = 0.1,
             selected_channels: list[str] | None = None,
             n_positions: int = 0,
@@ -97,6 +101,7 @@ class OnlineDecoder:
         self.padding_size_s = padding_size_s
         self.start_eval_marker = start_eval_marker
         self.max_eval_time_s = max_eval_time_s
+        self.first_trial_max_eval_time_s = first_trial_max_eval_time_s
         self.t_sleep_s = t_sleep_s
         self.selected_channels = selected_channels
         self.n_positions = n_positions
@@ -150,6 +155,19 @@ class OnlineDecoder:
         self.eeg_update_interval_s = min(max(self.t_sleep_s, 0.005), 0.02)
         if self.decoder_output_udp_port is not None:
             self.decoder_output_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def _max_eval_time_for_trial(self, trial_id: int | None = None) -> float:
+        if trial_id is None:
+            trial_id = self.current_trial_id
+
+        if (
+                trial_id == 1
+                and self.first_trial_max_eval_time_s is not None
+                and self.first_trial_max_eval_time_s > 0
+        ):
+            return float(self.first_trial_max_eval_time_s)
+
+        return float(self.max_eval_time_s)
 
     # -------- Connection and initialization methods --------------------------
     def load_model(
@@ -558,10 +576,11 @@ class OnlineDecoder:
             self.check_if_decoding_should_start()
         else:
             elapsed_s = time.time() - self.internal_decoding_start_time
-            if self.force_decision_requested or elapsed_s > self.max_eval_time_s:
+            max_eval_time_s = self._max_eval_time_for_trial()
+            if self.force_decision_requested or elapsed_s > max_eval_time_s:
                 reason = "force_decision request" if self.force_decision_requested else "timeout"
                 if not self.force_decision_requested:
-                    logger.info(f"Stopping decoding after {self.max_eval_time_s=}")
+                    logger.info(f"Stopping decoding after max_eval_time_s={max_eval_time_s}")
                 self.force_decision_requested = False
                 x = self._create_epoch()
                 if x.shape[2] > 0:
@@ -933,7 +952,8 @@ class OnlineDecoder:
             f"decoder armed immediately for trial {trial_id}."
         )
         self._send_udp_decision(f"armed:{trial_id}")
-        if processing_age_s >= max(0.2, self.max_eval_time_s - 0.25):
+        max_eval_time_s = self._max_eval_time_for_trial(trial_id)
+        if processing_age_s >= max(0.2, max_eval_time_s - 0.25):
             logger.info(
                 f"[CHECK] Trial {trial_id}: marker already covers the decision "
                 "window; running rCCA immediately."
@@ -942,7 +962,7 @@ class OnlineDecoder:
         else:
             self._schedule_udp_auto_decision(
                 trial_id,
-                delay_s=max(0.1, self.max_eval_time_s - processing_age_s),
+                delay_s=max(0.1, max_eval_time_s - processing_age_s),
             )
 
     def _schedule_udp_auto_decision(
@@ -955,7 +975,8 @@ class OnlineDecoder:
         if self.udp_trial_timer is not None:
             self.udp_trial_timer.cancel()
 
-        delay_s = max(0.1, float(self.max_eval_time_s if delay_s is None else delay_s))
+        max_eval_time_s = self._max_eval_time_for_trial(trial_id)
+        delay_s = max(0.1, float(max_eval_time_s if delay_s is None else delay_s))
         self.udp_trial_timer = threading.Timer(
             delay_s,
             self._auto_udp_force_decision,
@@ -988,6 +1009,8 @@ class OnlineDecoder:
             )
             return
 
+        max_eval_time_s = self._max_eval_time_for_trial(trial_id)
+
         if trial_id is not None and trial_id != self.current_trial_id:
             logger.info(
                 f"[CHECK] Force decision for trial {trial_id} replaced stale "
@@ -996,9 +1019,9 @@ class OnlineDecoder:
             self.current_trial_id = trial_id
             self.start_eval_time = 0.0
             self.internal_decoding_start_time = (
-                sent_time - self.max_eval_time_s
+                sent_time - max_eval_time_s
                 if sent_time is not None
-                else time.time() - self.max_eval_time_s
+                else time.time() - max_eval_time_s
             )
 
         if not self.is_decoding:
@@ -1009,9 +1032,9 @@ class OnlineDecoder:
             self.current_trial_id = trial_id
             self.start_eval_time = 0.0
             self.internal_decoding_start_time = (
-                sent_time - self.max_eval_time_s
+                sent_time - max_eval_time_s
                 if sent_time is not None
-                else time.time() - self.max_eval_time_s
+                else time.time() - max_eval_time_s
             )
 
         logger.info(f"[CHECK] Received UDP force_decision request for trial {self.current_trial_id}.")
@@ -1031,7 +1054,7 @@ class OnlineDecoder:
                 elapsed_s = max(0.0, time.time() - self.internal_decoding_start_time)
                 requested_window_s = max(
                     elapsed_s,
-                    self.max_eval_time_s + max(0.0, self.padding_size_s or 0.0),
+                    max_eval_time_s + max(0.0, self.padding_size_s or 0.0),
                 )
                 requested_window_s = min(
                     requested_window_s,
@@ -1310,7 +1333,7 @@ class OnlineDecoder:
 
 
 def online_decoder_factory(
-        config_path: Path = Path("./configs/decoder.toml"), preload: bool = True
+        config_path: Path = Path("./configs/decoder_unity.toml"), preload: bool = True
 ):
     """Factory function to create an OnlineDecoder object from a config file."""
     cfg = toml.load(config_path)
@@ -1329,6 +1352,7 @@ def online_decoder_factory(
         padding_size_s=cfg["streams"]["padding_size_s"],
         start_eval_marker=cfg["stimulus"]["trial_marker"],
         max_eval_time_s=cfg["online"]["max_eval_time_s"],
+        first_trial_max_eval_time_s=cfg["online"].get("first_trial_max_eval_time_s", None),
         t_sleep_s=cfg["online"].get("sleep_s", 0.1),
         selected_channels=cfg["data"].get("selected_channels", None),
         n_positions=cfg["stimulus"].get("n_keys", 0),
@@ -1345,7 +1369,7 @@ def online_decoder_factory(
 
 
 def cli_run_decoder(
-        conf_pth: Path = Path("./configs/decoder.toml"), log_level: int = 30
+        conf_pth: Path = Path("./configs/decoder_unity.toml"), log_level: int = 30
 ):
     # if the CLI is run, we most likely also want a console output
     logger = get_logger("cvep_decoder", add_console_handler=True)

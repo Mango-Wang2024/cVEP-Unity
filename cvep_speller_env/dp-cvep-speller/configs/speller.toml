@@ -32,7 +32,7 @@ n_trials = 10
 [online_accuracy]
 enabled = true
 true_targets = [ "1", "1", "1", "1", "1", "1", "1", "1", "1", "1",]
-decoder_config_file = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder.toml"
+decoder_config_file = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/configs/decoder_unity.toml"
 output_dir = "/Users/wang/dp-cvep-1/cvep_speller_env/data/online_accuracy"
 mode_label = ""
 open_after_save = true

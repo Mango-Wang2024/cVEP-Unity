@@ -119,9 +119,10 @@ def create_classifier(
     training_files_glob: str | None = None,
     out_file: Path | None = None,
     out_file_meta: Path | None = None,
+    config_path: Path = Path("./configs/decoder_unity.toml"),
 ) -> int:
 
-    cfg = toml.load("./configs/decoder.toml")
+    cfg = toml.load(config_path)
     # Apply overwrites
     if data_root is not None:
         cfg["data"]["data_root"] = data_root

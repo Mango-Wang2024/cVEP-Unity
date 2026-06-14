@@ -1,4 +1,5 @@
 from pathlib import Path
+from functools import partial
 
 from dareplane_utils.default_server.server import DefaultServer
 from fire import Fire
@@ -12,7 +13,7 @@ def main(
     port: int = 8080,
     ip: str = "127.0.0.1",
     loglevel: int = 10,
-    conf_pth: Path = Path("./configs/decoder.toml"),
+    conf_pth: Path = Path("./configs/decoder_unity.toml"),
 ):
     logger.setLevel(loglevel)
 
@@ -20,7 +21,7 @@ def main(
     decoder = online_decoder_factory(conf_pth, preload=False)
 
     pcommand_map = {
-        "FIT MODEL": create_classifier,
+        "FIT MODEL": partial(create_classifier, config_path=conf_pth),
         "LOAD MODEL": decoder.load_model,
         "CONNECT DECODER": decoder.init_all,
         "DECODE ONLINE": decoder.run,

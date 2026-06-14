@@ -179,7 +179,7 @@ def _validate_labels_match_stimulus(y: np.ndarray, V: np.ndarray, use_full_codeb
 
 
 def run_grid(
-    config_path: Path = Path("./configs/decoder.toml"),
+    config_path: Path = Path("./configs/decoder_unity.toml"),
     output_csv: Path = Path("./offline_accuracy_results.csv"),
     passband_grid: str | None = None,
     tmin_grid: str | None = None,
