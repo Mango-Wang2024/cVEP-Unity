@@ -1,4 +1,5 @@
 import socket
+import time
 from pathlib import Path
 
 import toml
@@ -35,11 +36,20 @@ class UnityFrontendController:
         if bridge_status != 0:
             return bridge_status
 
-        return self._send_command("training")
+        status = self._send_command("training")
+        if status == 0:
+            self._log_training_recording_ready()
+        return status
 
     def online(self) -> int:
-        self.marker_bridge.stop()
-        return self._send_command(self._online_command_from_decoder_config())
+        bridge_status = self.marker_bridge.start()
+        if bridge_status != 0:
+            return bridge_status
+
+        status = self._send_command(self._online_command_from_decoder_config())
+        if status == 0:
+            self._log_online_recording_ready()
+        return status
 
     def _online_command_from_decoder_config(self) -> str:
         try:
@@ -64,7 +74,9 @@ class UnityFrontendController:
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.sendto(payload, (self.host, int(self.port)))
+                for _ in range(3):
+                    sock.sendto(payload, (self.host, int(self.port)))
+                    time.sleep(0.05)
         except OSError as err:
             logger.error(
                 f"Could not send Unity frontend command '{command}' to "
@@ -73,7 +85,23 @@ class UnityFrontendController:
             return 1
 
         logger.info(
-            f"Sent Unity frontend command '{command}' to {self.host}:{self.port}. "
+            f"[CHECK] Sent Unity frontend command '{command}' to "
+            f"{self.host}:{self.port} with 3 UDP attempts. "
             "Make sure Unity is in Play Mode, then press c in Unity."
         )
         return 0
+
+    def _log_training_recording_ready(self) -> None:
+        logger.info(
+            "[CHECK] UNITY TRAINING is ready for recording. In Lab Recorder, click "
+            "Update and confirm both streams are selected: obci_eeg1 and "
+            "cvep-speller-stream. Start Lab Recorder now, then press C in Unity."
+        )
+
+    def _log_online_recording_ready(self) -> None:
+        logger.info(
+            "[CHECK] UNITY ONLINE marker stream is ready: cvep-speller-stream "
+            "should now appear in Lab Recorder. Click Update and select both "
+            "obci_eeg1 and cvep-speller-stream before pressing C in Unity if "
+            "you want an online XDF recording."
+        )

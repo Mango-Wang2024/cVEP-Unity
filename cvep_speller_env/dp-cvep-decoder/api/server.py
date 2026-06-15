@@ -20,9 +20,13 @@ def main(
     logger.debug(f"Initializing decoder with {conf_pth=}")
     decoder = online_decoder_factory(conf_pth, preload=False)
 
+    def load_model_checked():
+        logger.info("[CHECK] LOAD MODEL command received by decoder server.")
+        return decoder.load_model()
+
     pcommand_map = {
         "FIT MODEL": partial(create_classifier, config_path=conf_pth),
-        "LOAD MODEL": decoder.load_model,
+        "LOAD MODEL": load_model_checked,
         "CONNECT DECODER": decoder.init_all,
         "DECODE ONLINE": decoder.run,
     }

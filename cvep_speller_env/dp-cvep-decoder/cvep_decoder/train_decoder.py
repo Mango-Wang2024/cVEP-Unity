@@ -75,6 +75,46 @@ def get_training_data_files(cfg: dict) -> list[Path]:
     return files
 
 
+def estimate_effective_sfreq(raw_ts: NDArray, nominal_sfreq: float, fpath: Path) -> float:
+    if len(raw_ts) < 2:
+        logger.warning(
+            f"[CHECK] Could not estimate effective EEG sampling rate for {fpath}; "
+            f"using nominal {nominal_sfreq:.2f} Hz."
+        )
+        return nominal_sfreq
+
+    duration_s = float(raw_ts[-1] - raw_ts[0])
+    if duration_s <= 0 or not np.isfinite(duration_s):
+        logger.warning(
+            f"[CHECK] Invalid EEG timestamp duration for {fpath}; "
+            f"using nominal {nominal_sfreq:.2f} Hz."
+        )
+        return nominal_sfreq
+
+    effective_sfreq = float((len(raw_ts) - 1) / duration_s)
+    if effective_sfreq <= 0 or not np.isfinite(effective_sfreq):
+        logger.warning(
+            f"[CHECK] Invalid effective EEG sampling rate for {fpath}; "
+            f"using nominal {nominal_sfreq:.2f} Hz."
+        )
+        return nominal_sfreq
+
+    relative_difference = abs(effective_sfreq - nominal_sfreq) / nominal_sfreq
+    if relative_difference > 0.05:
+        logger.warning(
+            f"[CHECK] EEG effective sampling rate for {fpath.name} is "
+            f"{effective_sfreq:.2f} Hz, different from nominal "
+            f"{nominal_sfreq:.2f} Hz. Using effective rate for XDF epoching."
+        )
+    else:
+        logger.debug(
+            f"[CHECK] EEG effective sampling rate for {fpath.name} is "
+            f"{effective_sfreq:.2f} Hz."
+        )
+
+    return effective_sfreq
+
+
 def load_raw_and_events(
     fpath: Path,
     data_stream_name: str = "BioSemi",
@@ -108,7 +148,8 @@ def load_raw_and_events(
             raise ValueError(f"{selected_channels=} must be a list of `str` or `int` or `None`.")
         x = x[:, selected_ch_idx]
 
-    sfreq = int(float(data[names.index(data_stream_name)]["info"]["nominal_srate"][0]))
+    nominal_sfreq = float(data[names.index(data_stream_name)]["info"]["nominal_srate"][0])
+    sfreq = estimate_effective_sfreq(raw_ts, nominal_sfreq, fpath)
 
     return x, events, sfreq
 
@@ -189,13 +230,14 @@ def create_classifier(
         onsets = events[events[:, 1] == cfg["stimulus"]["trial_marker"], 0]
 
         # Add padding interval to catch filtering artefacts
+        padding_s = cfg["streams"]["padding_size_s"] or 0.0
         if cfg["streams"]["padding_size_s"] is not None and cfg["streams"]["padding_size_s"] > 0:
             pad = int(cfg["streams"]["padding_size_s"] * sfreq)
             onsets -= pad
 
         # Slice data to trials including padding interval to remove filtering artefacts
         eeg_list += [
-            xf[t - int(cmeta.tmin * sfreq):t + int(cmeta.tmax * sfreq), :]
+            xf[t - int(cmeta.tmin * sfreq):t + int((cmeta.tmax + padding_s) * sfreq), :]
             for t in onsets
         ]
 
@@ -210,7 +252,8 @@ def create_classifier(
     y = np.stack(lbl_list, axis=0)  # trials
 
     # Resample
-    X = resample(X, num=int((cmeta.tmax - cmeta.tmin) * cmeta.sfreq), axis=2)
+    padding_s = cfg["streams"]["padding_size_s"] or 0.0
+    X = resample(X, num=int((cmeta.tmax - cmeta.tmin + padding_s) * cmeta.sfreq), axis=2)
     if np.isnan(X).sum() > 0:
         logger.error("NaNs found after resampling")
 

@@ -23,6 +23,10 @@ class UdpToLslMarkerBridge:
 
     def start(self) -> int:
         if self.thread is not None and self.thread.is_alive():
+            logger.info(
+                f'[CHECK] Marker stream "{self.stream_name}" is already available '
+                "for Lab Recorder."
+            )
             return 0
 
         info = StreamInfo(
@@ -55,6 +59,10 @@ class UdpToLslMarkerBridge:
         logger.info(
             f'[CHECK] Unity marker LSL bridge started: UDP {self.host}:{self.port} '
             f'-> LSL "{self.stream_name}".'
+        )
+        logger.info(
+            f'[CHECK] Marker stream "{self.stream_name}" is ready. In Lab Recorder, '
+            "click Update and select it together with obci_eeg1."
         )
         return 0
 

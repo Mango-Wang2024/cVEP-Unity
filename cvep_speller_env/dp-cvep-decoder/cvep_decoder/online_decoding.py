@@ -20,7 +20,7 @@ from scipy.signal import resample
 from cvep_decoder.utils.logging import logger
 
 
-REALTIME_UDP_FIX_VERSION = "udp-arm-v9-fresh-blocking-receiver"
+REALTIME_UDP_FIX_VERSION = "udp-arm-v11-auto-decision-timer"
 
 
 class OnlineDecoder:
@@ -188,16 +188,25 @@ class OnlineDecoder:
             else self.classifier_meta_path
         )
         logger.info(f"Loading classifier from {cp=} and {cmp=}.")
+        logger.info(f"[CHECK] LOAD MODEL started: decoder model={cp}, meta={cmp}.")
 
         try:
             self.classifier = joblib.load(cp)
             self.classifier_meta = json.load(open(cmp, "r"))
         except FileNotFoundError:
             logger.error(f"Could not load classifier from {cp=} or {cmp=}. Validate that both exist.")
+            logger.error(
+                f"[CHECK] LOAD MODEL failed: missing decoder model or meta file. "
+                f"Expected model={cp}, meta={cmp}."
+            )
             return 1
 
         self.classifier_input_sfreq = self.classifier_meta["sfreq"]
         self.band = self.classifier_meta["fband"]
+        logger.info(
+            f"[CHECK] LOAD MODEL finished: model is ready "
+            f"(classifier_sfreq={self.classifier_input_sfreq} Hz, band={self.band})."
+        )
 
         return 0
 
@@ -302,6 +311,10 @@ class OnlineDecoder:
 
     def connect_data_stream(self):
         logger.info(f'Connecting to data stream "{self.data_stream_name}".')
+        logger.info(
+            f'[CHECK] CONNECT DECODER waiting for EEG stream "{self.data_stream_name}". '
+            "If this line stays visible for a long time, check OpenBCI LSL and Lab Recorder Update."
+        )
         self.input_sw = StreamWatcher(self.data_stream_name, buffer_size_s=self.buffer_size_s, logger=logger)
         self.input_sw.connect_to_stream()
 
@@ -399,8 +412,8 @@ class OnlineDecoder:
         logger.info("[CHECK] Filter bank created.")
         if self.marker_udp_port is not None:
             logger.info(
-                "[CHECK] UDP mode active: marker listener has priority; EEG is "
-                "pulled once at rCCA decision time to avoid marker backlog."
+                "[CHECK] UDP mode active: marker listener has priority; decoder "
+                "schedules an automatic rCCA decision from start_trial timing."
             )
         else:
             self.start_eeg_update_thread()
@@ -940,7 +953,7 @@ class OnlineDecoder:
         self.is_decoding = True
         self.current_trial_id = trial_id
         self.force_decision_requested = False
-        self.internal_decoding_start_time = sent_time if sent_time is not None else time.time()
+        self.internal_decoding_start_time = now
         self.start_eval_time = 0.0
         logger.info(
             f"[CHECK] Trial {trial_id}: UDP start marker recorded without per-trial "

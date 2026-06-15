@@ -106,11 +106,12 @@ def _load_epochs_and_labels(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
         xf = fb.get_data()[:, :, 0]
 
         onsets = events[events[:, 1] == cfg["stimulus"]["trial_marker"], 0]
+        padding_s = cfg["streams"]["padding_size_s"] or 0.0
         if cfg["streams"]["padding_size_s"] is not None and cfg["streams"]["padding_size_s"] > 0:
             onsets -= int(cfg["streams"]["padding_size_s"] * sfreq)
 
         eeg_list += [
-            xf[t - int(cmeta.tmin * sfreq):t + int(cmeta.tmax * sfreq), :]
+            xf[t - int(cmeta.tmin * sfreq):t + int((cmeta.tmax + padding_s) * sfreq), :]
             for t in onsets
         ]
 
@@ -129,7 +130,8 @@ def _load_epochs_and_labels(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
     X = np.stack(eeg_list, axis=0).transpose(0, 2, 1)
     y = np.stack(lbl_list, axis=0)
 
-    X = resample(X, num=int((cmeta.tmax - cmeta.tmin) * cmeta.sfreq), axis=2)
+    padding_s = cfg["streams"]["padding_size_s"] or 0.0
+    X = resample(X, num=int((cmeta.tmax - cmeta.tmin + padding_s) * cmeta.sfreq), axis=2)
 
     if cfg["streams"]["padding_size_s"] is not None and cfg["streams"]["padding_size_s"] > 0:
         pad = int(cfg["streams"]["padding_size_s"] * cmeta.sfreq)

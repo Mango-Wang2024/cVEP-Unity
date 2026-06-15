@@ -28,7 +28,7 @@ target_freq_hz = 60
 passband_hz = [ 6, 40,]
 
 [decoder]
-training_mode = "calibration"
+training_mode = "zero"
 decoder_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder.joblib"
 decoder_meta_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_meta.json"
 decoder_subset_layout_file = "/Users/wang/dp-cvep-1/cvep_speller_env/data/decoder_subset_layout.json"
