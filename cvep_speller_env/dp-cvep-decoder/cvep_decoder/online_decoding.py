@@ -144,6 +144,7 @@ class OnlineDecoder:
         self.force_decision_requested: bool = False
         self.udp_decoding_enabled: bool = False
         self.completed_udp_trial_ids: set[int] = set()
+        self.completed_udp_trial_classes: dict[int, int] = {}
         self.max_udp_packet_age_s: float = 2.0
         self.run_thread: threading.Thread | None = None
         self.run_stop_event: threading.Event | None = None
@@ -453,6 +454,7 @@ class OnlineDecoder:
                 with self.processing_lock:
                     self.flush_input_stream(reason="before UDP decoder")
                 self.completed_udp_trial_ids.clear()
+                self.completed_udp_trial_classes.clear()
                 self.is_decoding = False
                 self.current_trial_id = None
                 self.force_decision_requested = False
@@ -1017,6 +1019,14 @@ class OnlineDecoder:
 
     def _handle_udp_force_decision(self, trial_id: int | None, sent_time: float | None = None) -> None:
         if trial_id is not None and trial_id in self.completed_udp_trial_ids:
+            if trial_id in self.completed_udp_trial_classes:
+                y = self.completed_udp_trial_classes[trial_id]
+                logger.info(
+                    f"[CHECK] Resending completed class {y} for trial {trial_id} "
+                    "after duplicate force_decision."
+                )
+                self._send_udp_decision(f"class:{trial_id}:{y}")
+                return
             logger.info(
                 f"[CHECK] Ignored duplicate force_decision for completed trial {trial_id}."
             )
@@ -1240,6 +1250,7 @@ class OnlineDecoder:
             self._send_udp_decision(f"class:{self.current_trial_id}:{int(y)}")
         if decision_trial_id is not None:
             self.completed_udp_trial_ids.add(decision_trial_id)
+            self.completed_udp_trial_classes[decision_trial_id] = int(y)
         self.is_decoding = False
         self.current_trial_id = None
 
