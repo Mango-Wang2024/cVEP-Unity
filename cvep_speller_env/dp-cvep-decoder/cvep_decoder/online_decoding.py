@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 from scipy.signal import resample
 from scipy.stats import beta
 
+from cvep_decoder.signal_cleanup import StatefulNotchFilter
 from cvep_decoder.utils.logging import logger
 
 
@@ -93,6 +94,7 @@ class OnlineDecoder:
             soft_decision_temperature: float = 1.0,
             max_eeg_age_s: float = 0.5,
             zero_training_cumulative_updates: bool = True,
+            line_noise_notch_hz: list[float] | None = None,
     ):
 
         self.classifier_path = decoder_file
@@ -120,6 +122,7 @@ class OnlineDecoder:
         self.soft_decision_temperature = soft_decision_temperature
         self.max_eeg_age_s = max(0.1, float(max_eeg_age_s))
         self.zero_training_cumulative_updates = bool(zero_training_cumulative_updates)
+        self.line_noise_notch_hz = line_noise_notch_hz or []
 
         self.selected_ch_idx = None
         self.is_decoding: bool = False
@@ -144,6 +147,7 @@ class OnlineDecoder:
         self.measured_input_sfreq: float | None = None
         self.input_chs_info: list[dict[str, str]] | None = None
         self.filterbank: FilterBank | None = None
+        self.line_noise_notch_filter: StatefulNotchFilter | None = None
         self.regularized_next_time: float | None = None
         self.regularized_previous_time: float | None = None
         self.regularized_previous_sample: NDArray | None = None
@@ -359,9 +363,35 @@ class OnlineDecoder:
                 self.selected_ch_idx = self.selected_channels
             else:
                 raise logger.error(f"{self.selected_channels=} must be a list of `str` or `int` or `None`.")
+            self._create_line_noise_notch_filter()
             return 1
 
+        self._create_line_noise_notch_filter()
         return 0
+
+    def _create_line_noise_notch_filter(self) -> None:
+        self.line_noise_notch_filter = None
+        if not self.line_noise_notch_hz:
+            return
+        if self.input_sfreq is None:
+            return
+
+        notch_filter = StatefulNotchFilter(
+            sfreq=float(self.input_sfreq),
+            freqs=self.line_noise_notch_hz,
+        )
+        if notch_filter.enabled:
+            self.line_noise_notch_filter = notch_filter
+            logger.info(
+                f"[CHECK] Line-noise notch filter enabled at "
+                f"{self.line_noise_notch_hz} Hz before band-pass filtering."
+            )
+        else:
+            logger.warning(
+                f"[CHECK] Line-noise notch filter skipped: requested "
+                f"{self.line_noise_notch_hz} Hz but EEG sampling rate is "
+                f"{self.input_sfreq:.2f} Hz."
+            )
 
     def _enable_eeg_timestamp_processing(self) -> None:
         """Reconnect the EEG inlet with LSL timestamp correction enabled."""
@@ -1382,6 +1412,8 @@ class OnlineDecoder:
             t = self.input_sw.unfold_buffer_t()[-self.input_sw.n_new:]
             x, t = self._regularize_eeg_samples(x, t)
             if len(t) > 0:
+                if self.line_noise_notch_filter is not None:
+                    x = self.line_noise_notch_filter.filter(x)
                 self.filterbank.filter(x, t)
             self.input_sw.n_new = 0  # makes sure samples are filtered only once
 
@@ -1792,6 +1824,7 @@ def online_decoder_factory(
         zero_training_cumulative_updates=cfg["decoder"].get(
             "zero_training_cumulative_updates", True
         ),
+        line_noise_notch_hz=cfg["data"].get("line_noise_notch_hz", []),
     )
 
     if preload:

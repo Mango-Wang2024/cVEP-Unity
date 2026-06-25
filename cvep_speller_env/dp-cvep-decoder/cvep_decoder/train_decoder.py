@@ -14,6 +14,7 @@ import pyxdf
 import toml
 from scipy.signal import resample
 
+from cvep_decoder.signal_cleanup import apply_notch_filter
 from cvep_decoder.utils.logging import logger
 
 
@@ -226,6 +227,11 @@ def create_classifier(
             data_stream_name=cfg["streams"]["data_stream_name"],
             selected_channels=cfg["data"].get("selected_channels", None),
         )
+
+        notch_hz = cfg["data"].get("line_noise_notch_hz", [])
+        if notch_hz:
+            logger.info(f"[CHECK] Applying line-noise notch filter at {notch_hz} Hz to {t_file}.")
+            x = apply_notch_filter(x, sfreq=sfreq, freqs=notch_hz)
 
         # Bandpass filter
         fb = FilterBank(

@@ -27,6 +27,7 @@ selected_channels = [ 0, 1, 2, 3, 4, 5, 6, 7,]
 capfile = "/Users/wang/dp-cvep-1/cvep_speller_env/dp-cvep-decoder/cvep_decoder/caps/openbci8_headset.loc"
 target_freq_hz = 60
 passband_hz = [ 6, 40,]
+line_noise_notch_hz = [ 50,]
 
 [decoder]
 training_mode = "zero"
