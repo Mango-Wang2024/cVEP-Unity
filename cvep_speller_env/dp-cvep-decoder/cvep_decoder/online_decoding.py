@@ -3,11 +3,13 @@ import queue
 import socket
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pylsl
+import pyntbci
 import toml
 from dareplane_utils.general.time import sleep_s
 from dareplane_utils.logging.logger import get_logger
@@ -16,11 +18,12 @@ from dareplane_utils.stream_watcher.lsl_stream_watcher import StreamWatcher
 from fire import Fire
 from numpy.typing import NDArray
 from scipy.signal import resample
+from scipy.stats import beta
 
 from cvep_decoder.utils.logging import logger
 
 
-REALTIME_UDP_FIX_VERSION = "udp-arm-v11-auto-decision-timer"
+REALTIME_UDP_FIX_VERSION = "udp-arm-v14-timestamp-regularized-eeg"
 
 
 class OnlineDecoder:
@@ -72,6 +75,7 @@ class OnlineDecoder:
             marker_udp_port: int | None,
             decoder_output_udp_host: str,
             decoder_output_udp_port: int | None,
+            decoder_output_udp_fallback_port: int | None,
             data_stream_name: str,
             decoder_stream_name: str,
             buffer_size_s: float,
@@ -79,6 +83,7 @@ class OnlineDecoder:
             start_eval_marker: str,
             max_eval_time_s: float = 10,
             first_trial_max_eval_time_s: float | None = None,
+            first_trial_target_accuracy: float = 0.99,
             t_sleep_s: float = 0.1,
             selected_channels: list[str] | None = None,
             n_positions: int = 0,
@@ -86,6 +91,8 @@ class OnlineDecoder:
             soft_decision_smoothing: float = 0.5,
             soft_decision_min_confidence: float = 0.0,
             soft_decision_temperature: float = 1.0,
+            max_eeg_age_s: float = 0.5,
+            zero_training_cumulative_updates: bool = True,
     ):
 
         self.classifier_path = decoder_file
@@ -95,6 +102,7 @@ class OnlineDecoder:
         self.marker_udp_port = marker_udp_port
         self.decoder_output_udp_host = decoder_output_udp_host
         self.decoder_output_udp_port = decoder_output_udp_port
+        self.decoder_output_udp_fallback_port = decoder_output_udp_fallback_port
         self.data_stream_name = data_stream_name
         self.decoder_stream_name = decoder_stream_name
         self.buffer_size_s = buffer_size_s
@@ -102,6 +110,7 @@ class OnlineDecoder:
         self.start_eval_marker = start_eval_marker
         self.max_eval_time_s = max_eval_time_s
         self.first_trial_max_eval_time_s = first_trial_max_eval_time_s
+        self.first_trial_target_accuracy = float(first_trial_target_accuracy)
         self.t_sleep_s = t_sleep_s
         self.selected_channels = selected_channels
         self.n_positions = n_positions
@@ -109,6 +118,8 @@ class OnlineDecoder:
         self.soft_decision_smoothing = soft_decision_smoothing
         self.soft_decision_min_confidence = soft_decision_min_confidence
         self.soft_decision_temperature = soft_decision_temperature
+        self.max_eeg_age_s = max(0.1, float(max_eeg_age_s))
+        self.zero_training_cumulative_updates = bool(zero_training_cumulative_updates)
 
         self.selected_ch_idx = None
         self.is_decoding: bool = False
@@ -129,9 +140,13 @@ class OnlineDecoder:
         self.marker_time_correction_s: float = 0.0
         self.marker_time_correction_valid: bool = False
         self.input_sw: StreamWatcher | None = None
-        self.input_sfreq: int | None = None
+        self.input_sfreq: float | None = None
+        self.measured_input_sfreq: float | None = None
         self.input_chs_info: list[dict[str, str]] | None = None
         self.filterbank: FilterBank | None = None
+        self.regularized_next_time: float | None = None
+        self.regularized_previous_time: float | None = None
+        self.regularized_previous_sample: NDArray | None = None
         self.output_sw: StreamWatcher | None = None
         self.band = None
         self.classifier_input_sfreq = None
@@ -145,6 +160,7 @@ class OnlineDecoder:
         self.udp_decoding_enabled: bool = False
         self.completed_udp_trial_ids: set[int] = set()
         self.completed_udp_trial_classes: dict[int, int] = {}
+        self.completed_udp_trial_errors: dict[int, str] = {}
         self.max_udp_packet_age_s: float = 2.0
         self.run_thread: threading.Thread | None = None
         self.run_stop_event: threading.Event | None = None
@@ -154,7 +170,10 @@ class OnlineDecoder:
         self.run_lock = threading.Lock()
         self.processing_lock = threading.Lock()
         self.eeg_update_interval_s = min(max(self.t_sleep_s, 0.005), 0.02)
-        if self.decoder_output_udp_port is not None:
+        if (
+                self.decoder_output_udp_port is not None
+                or self.decoder_output_udp_fallback_port is not None
+        ):
             self.decoder_output_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def _max_eval_time_for_trial(self, trial_id: int | None = None) -> float:
@@ -206,7 +225,8 @@ class OnlineDecoder:
         self.band = self.classifier_meta["fband"]
         logger.info(
             f"[CHECK] LOAD MODEL finished: model is ready "
-            f"(classifier_sfreq={self.classifier_input_sfreq} Hz, band={self.band})."
+            f"(model_type={type(self.classifier).__name__}, "
+            f"classifier_sfreq={self.classifier_input_sfreq} Hz, band={self.band})."
         )
 
         return 0
@@ -319,7 +339,12 @@ class OnlineDecoder:
         self.input_sw = StreamWatcher(self.data_stream_name, buffer_size_s=self.buffer_size_s, logger=logger)
         self.input_sw.connect_to_stream()
 
-        self.input_sfreq = int(self.input_sw.inlet.info().nominal_srate())
+        nominal_sfreq = float(self.input_sw.inlet.info().nominal_srate())
+        self._enable_eeg_timestamp_processing()
+        self.measured_input_sfreq = self.estimate_live_input_sfreq(nominal_sfreq)
+        self.input_sfreq = (
+            nominal_sfreq if nominal_sfreq > 0 else self.measured_input_sfreq
+        )
         self.input_chs_info = [dict(ch_name=ch_name, type="EEG") for ch_name in self.input_sw.channel_names]
 
         if self.selected_channels is None:
@@ -337,6 +362,104 @@ class OnlineDecoder:
             return 1
 
         return 0
+
+    def _enable_eeg_timestamp_processing(self) -> None:
+        """Reconnect the EEG inlet with LSL timestamp correction enabled."""
+
+        if self.input_sw is None or not self.input_sw.streams:
+            return
+
+        if self.input_sw.inlet is not None:
+            self.input_sw.inlet.close_stream()
+
+        processing_flags = (
+            pylsl.proc_clocksync
+            | pylsl.proc_dejitter
+            | pylsl.proc_monotonize
+        )
+        self.input_sw.inlet = pylsl.StreamInlet(
+            self.input_sw.streams[0],
+            processing_flags=processing_flags,
+        )
+        self.input_sw._init_buffer()
+        self.input_sw.update()
+        logger.info(
+            "[CHECK] EEG inlet timestamp correction enabled: "
+            "clocksync + dejitter + monotonize."
+        )
+
+    def estimate_live_input_sfreq(
+            self,
+            nominal_sfreq: float,
+            duration_s: float = 2.0,
+            min_samples: int = 40,
+    ) -> float:
+        """Estimate the real live EEG sampling rate from LSL timestamps."""
+
+        if self.input_sw is None:
+            return nominal_sfreq
+
+        logger.info(
+            f"[CHECK] Live EEG nominal sampling rate is {nominal_sfreq:.2f} Hz; "
+            f"measuring effective rate for {duration_s:.1f}s."
+        )
+
+        t_start = time.time()
+        while time.time() - t_start < duration_s:
+            self.input_sw.update()
+            time.sleep(0.02)
+
+        self.input_sw.update()
+        timestamps = np.asarray(self.input_sw.unfold_buffer_t(), dtype=float)
+        timestamps = timestamps[np.isfinite(timestamps)]
+        if len(timestamps) > 0:
+            timestamps = timestamps[timestamps >= timestamps[-1] - duration_s]
+
+        if len(timestamps) < min_samples:
+            message = (
+                "[CHECK] EEG stream is discoverable but not delivering enough fresh samples: "
+                f"only {len(timestamps)} timestamp(s) in {duration_s:.1f}s. "
+                "CONNECT DECODER aborted."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        elapsed_s = float(timestamps[-1] - timestamps[0])
+        if elapsed_s <= 0:
+            message = (
+                "[CHECK] EEG stream timestamps are not advancing: "
+                f"span={elapsed_s:.6f}s. CONNECT DECODER aborted."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        effective_sfreq = float((len(timestamps) - 1) / elapsed_s)
+        if not np.isfinite(effective_sfreq) or effective_sfreq <= 0:
+            message = (
+                "[CHECK] EEG stream produced an invalid effective sampling rate "
+                f"({effective_sfreq}). CONNECT DECODER aborted."
+            )
+            logger.error(message)
+            raise RuntimeError(message)
+
+        if nominal_sfreq > 0:
+            relative_delta = abs(effective_sfreq - nominal_sfreq) / nominal_sfreq
+        else:
+            relative_delta = 0.0
+
+        if relative_delta >= 0.05:
+            logger.warning(
+                f"[CHECK] Live EEG effective sampling rate differs from nominal: "
+                f"nominal={nominal_sfreq:.2f} Hz, effective={effective_sfreq:.2f} Hz. "
+                "EEG timestamps will be regularized before filtering."
+            )
+        else:
+            logger.info(
+                f"[CHECK] Live EEG effective sampling rate is {effective_sfreq:.2f} Hz "
+                f"(nominal={nominal_sfreq:.2f} Hz)."
+            )
+
+        return effective_sfreq
 
     def create_filterbank(self):
         logger.info("Creating the classifier and the filter bank.")
@@ -406,18 +529,19 @@ class OnlineDecoder:
         self.connect_data_stream()
         logger.info(
             f'[CHECK] Connected EEG stream "{self.data_stream_name}" '
-            f"with sfreq={self.input_sfreq} Hz and channels={self.input_sw.channel_names}."
+            f"with processing_sfreq={self.input_sfreq:.2f} Hz, "
+            f"measured_sfreq={self.measured_input_sfreq:.2f} Hz, "
+            f"and channels={self.input_sw.channel_names}."
         )
         self.flush_input_stream(reason="before online decoding setup")
         self.create_filterbank()
         logger.info("[CHECK] Filter bank created.")
+        self.start_eeg_update_thread()
         if self.marker_udp_port is not None:
             logger.info(
                 "[CHECK] UDP mode active: marker listener has priority; decoder "
                 "schedules an automatic rCCA decision from start_trial timing."
             )
-        else:
-            self.start_eeg_update_thread()
         self.create_decoder_stream()
         logger.info(
             f'[CHECK] Decoder output stream "{self.decoder_stream_name}" created '
@@ -453,8 +577,11 @@ class OnlineDecoder:
                 self.drain_udp_marker_queue(reason="before UDP decoder")
                 with self.processing_lock:
                     self.flush_input_stream(reason="before UDP decoder")
+                    self._reset_eeg_regularizer()
+                    self.create_filterbank()
                 self.completed_udp_trial_ids.clear()
                 self.completed_udp_trial_classes.clear()
+                self.completed_udp_trial_errors.clear()
                 self.is_decoding = False
                 self.current_trial_id = None
                 self.force_decision_requested = False
@@ -522,6 +649,11 @@ class OnlineDecoder:
             logger.info(f"[CHECK] Flushed {n_flushed} old EEG samples{suffix}.")
 
         return n_flushed
+
+    def _reset_eeg_regularizer(self) -> None:
+        self.regularized_next_time = None
+        self.regularized_previous_time = None
+        self.regularized_previous_sample = None
 
     def drain_udp_marker_socket(self, reason: str = "") -> int:
         """Remove queued UDP trial packets before starting a fresh online run."""
@@ -957,6 +1089,16 @@ class OnlineDecoder:
         self.force_decision_requested = False
         self.internal_decoding_start_time = now
         self.start_eval_time = 0.0
+        with self.processing_lock:
+            if self._update_eeg_filter_once():
+                eeg_times = self.input_sw.unfold_buffer_t()
+                eeg_times = eeg_times[np.isfinite(eeg_times)]
+                if len(eeg_times) > 0:
+                    self.start_eval_time = float(eeg_times[-1])
+                    logger.info(
+                        f"[CHECK] Trial {trial_id}: EEG onset anchored to the "
+                        f"start_trial marker at {self.start_eval_time:.6f}."
+                    )
         logger.info(
             f"[CHECK] Trial {trial_id}: UDP start marker recorded without per-trial "
             "EEG flush, so marker handling stays real-time."
@@ -1027,6 +1169,10 @@ class OnlineDecoder:
                 )
                 self._send_udp_decision(f"class:{trial_id}:{y}")
                 return
+            if trial_id in self.completed_udp_trial_errors:
+                reason = self.completed_udp_trial_errors[trial_id]
+                self._send_udp_decision(f"error:{trial_id}:{reason}")
+                return
             logger.info(
                 f"[CHECK] Ignored duplicate force_decision for completed trial {trial_id}."
             )
@@ -1062,22 +1208,41 @@ class OnlineDecoder:
 
         logger.info(f"[CHECK] Received UDP force_decision request for trial {self.current_trial_id}.")
         with self.processing_lock:
-            self._update_eeg_filter_once()
-            eeg_times = self.filterbank.ring_buffer.unfold_buffer_t()
-            eeg_times = eeg_times[np.isfinite(eeg_times)]
-            if len(eeg_times) == 0:
-                logger.warning(
-                    f"[CHECK] Trial {self.current_trial_id}: EEG buffer is empty; no rCCA output sent."
+            if trial_id is not None and trial_id in self.completed_udp_trial_ids:
+                if trial_id in self.completed_udp_trial_classes:
+                    y = self.completed_udp_trial_classes[trial_id]
+                    logger.info(
+                        f"[CHECK] Resending completed class {y} for trial {trial_id} "
+                        "after force_decision race."
+                    )
+                    self._send_udp_decision(f"class:{trial_id}:{y}")
+                    return
+                if trial_id in self.completed_udp_trial_errors:
+                    reason = self.completed_udp_trial_errors[trial_id]
+                    self._send_udp_decision(f"error:{trial_id}:{reason}")
+                    return
+                logger.info(
+                    f"[CHECK] Ignored duplicate force_decision for completed trial {trial_id} "
+                    "after force_decision race."
                 )
-                self.is_decoding = False
-                self.current_trial_id = None
+                return
+
+            if not self._update_eeg_filter_once():
+                self._reject_udp_trial("eeg_update_failed")
+                return
+
+            eeg_times = self.input_sw.unfold_buffer_t()
+            eeg_times = eeg_times[np.isfinite(eeg_times)]
+            eeg_error = self._validate_fresh_eeg(eeg_times, max_eval_time_s)
+            if eeg_error is not None:
+                self._reject_udp_trial(eeg_error)
                 return
 
             if self.start_eval_time <= 0:
                 elapsed_s = max(0.0, time.time() - self.internal_decoding_start_time)
                 requested_window_s = max(
                     elapsed_s,
-                    max_eval_time_s + max(0.0, self.padding_size_s or 0.0),
+                    max_eval_time_s,
                 )
                 requested_window_s = min(
                     requested_window_s,
@@ -1105,6 +1270,98 @@ class OnlineDecoder:
                 self.is_decoding = False
                 self.current_trial_id = None
 
+    def _validate_fresh_eeg(
+            self,
+            eeg_times: NDArray,
+            required_window_s: float,
+    ) -> str | None:
+        if len(eeg_times) == 0:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: EEG buffer is empty."
+            )
+            return "empty_eeg"
+
+        latest_age_s = float(pylsl.local_clock() - eeg_times[-1])
+        if latest_age_s > self.max_eeg_age_s:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: latest EEG sample is stale "
+                f"by {latest_age_s:.3f}s (limit={self.max_eeg_age_s:.3f}s)."
+            )
+            return "stale_eeg"
+        if latest_age_s < -1.0:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: EEG clock is "
+                f"{-latest_age_s:.3f}s ahead of the local LSL clock."
+            )
+            return "eeg_clock_mismatch"
+
+        required_window_s = max(0.1, float(required_window_s))
+        recent = eeg_times[eeg_times >= eeg_times[-1] - required_window_s]
+        recent_span_s = float(recent[-1] - recent[0]) if len(recent) > 1 else 0.0
+        min_span_s = required_window_s * 0.9
+        if recent_span_s < min_span_s:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: insufficient fresh EEG for "
+                f"a {required_window_s:.3f}s decision window "
+                f"(samples={len(recent)}, span={recent_span_s:.3f}/{min_span_s:.3f}s)."
+            )
+            return "insufficient_eeg"
+
+        intervals = np.diff(recent)
+        if len(intervals) == 0 or np.any(intervals <= 0):
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: corrected EEG timestamps "
+                "are not strictly increasing."
+            )
+            return "nonmonotonic_eeg"
+
+        effective_sfreq = float((len(recent) - 1) / recent_span_s)
+        high_cut_hz = float(max(self.band)) if self.band else 0.0
+        min_effective_sfreq = max(
+            float(self.classifier_input_sfreq or 0.0),
+            high_cut_hz * 2.2,
+        )
+        max_gap_s = float(np.max(intervals))
+        if effective_sfreq < min_effective_sfreq:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: effective EEG rate "
+                f"{effective_sfreq:.2f} Hz is below the usable minimum "
+                f"{min_effective_sfreq:.2f} Hz."
+            )
+            return "insufficient_eeg_rate"
+        if max_gap_s > 0.1:
+            logger.warning(
+                f"[CHECK] Trial {self.current_trial_id}: EEG timestamp gap "
+                f"{max_gap_s:.3f}s exceeds the 0.100s limit."
+            )
+            return "large_eeg_gap"
+
+        logger.info(
+            f"[CHECK] Trial {self.current_trial_id}: usable EEG coverage "
+            f"{recent_span_s:.3f}s, effective rate {effective_sfreq:.2f} Hz, "
+            f"maximum gap {max_gap_s:.3f}s."
+        )
+
+        return None
+
+    def _reject_udp_trial(self, reason: str) -> None:
+        trial_id = self.current_trial_id
+        logger.warning(
+            f"[CHECK] Trial {trial_id}: decoder rejected trial because {reason}."
+        )
+        if self.udp_trial_timer is not None:
+            self.udp_trial_timer.cancel()
+            self.udp_trial_timer = None
+        if trial_id is not None:
+            self.completed_udp_trial_ids.add(trial_id)
+            self.completed_udp_trial_errors[trial_id] = reason
+            self._send_udp_decision(f"error:{trial_id}:{reason}")
+        self.is_decoding = False
+        self.current_trial_id = None
+        self._reset_eeg_regularizer()
+        if self.input_chs_info and self.selected_ch_idx is not None and self.band:
+            self.create_filterbank()
+
     def _update_eeg_filter_once(self) -> bool:
         if self.input_sw is None or self.filterbank is None:
             return False
@@ -1123,8 +1380,69 @@ class OnlineDecoder:
         if self.input_sw.n_new > 0:
             x = self.input_sw.unfold_buffer()[-self.input_sw.n_new:, self.selected_ch_idx]
             t = self.input_sw.unfold_buffer_t()[-self.input_sw.n_new:]
-            self.filterbank.filter(x, t)
+            x, t = self._regularize_eeg_samples(x, t)
+            if len(t) > 0:
+                self.filterbank.filter(x, t)
             self.input_sw.n_new = 0  # makes sure samples are filtered only once
+
+    def _regularize_eeg_samples(
+            self,
+            samples: NDArray,
+            timestamps: NDArray,
+    ) -> tuple[NDArray, NDArray]:
+        """Interpolate corrected EEG timestamps onto the fixed processing grid."""
+
+        samples = np.asarray(samples)
+        timestamps = np.asarray(timestamps, dtype=float)
+        valid = np.isfinite(timestamps) & np.all(np.isfinite(samples), axis=1)
+        samples = samples[valid]
+        timestamps = timestamps[valid]
+        if len(timestamps) == 0:
+            return samples, timestamps
+
+        monotonic = np.concatenate(([True], np.diff(timestamps) > 0))
+        samples = samples[monotonic]
+        timestamps = timestamps[monotonic]
+        if len(timestamps) == 0:
+            return samples, timestamps
+
+        if (
+                self.regularized_previous_time is not None
+                and self.regularized_previous_sample is not None
+                and self.regularized_previous_time < timestamps[0]
+        ):
+            samples = np.vstack((self.regularized_previous_sample, samples))
+            timestamps = np.concatenate(
+                ([self.regularized_previous_time], timestamps)
+            )
+
+        self.regularized_previous_time = float(timestamps[-1])
+        self.regularized_previous_sample = samples[-1].copy()
+        if len(timestamps) < 2:
+            return np.empty((0, samples.shape[1]), dtype=samples.dtype), np.empty(0)
+
+        step_s = 1.0 / float(self.input_sfreq)
+        grid_start = (
+            float(timestamps[0])
+            if self.regularized_next_time is None
+            else max(float(timestamps[0]), self.regularized_next_time)
+        )
+        grid_end = float(timestamps[-1])
+        if grid_start > grid_end:
+            return np.empty((0, samples.shape[1]), dtype=samples.dtype), np.empty(0)
+
+        regular_times = np.arange(
+            grid_start,
+            grid_end + step_s * 0.5,
+            step_s,
+            dtype=float,
+        )
+        regular_samples = np.column_stack([
+            np.interp(regular_times, timestamps, samples[:, ch])
+            for ch in range(samples.shape[1])
+        ]).astype(samples.dtype, copy=False)
+        self.regularized_next_time = float(regular_times[-1] + step_s)
+        return regular_samples, regular_times
 
     def _create_epoch(self) -> NDArray:
         x = self.filterbank.get_data()[:, :, 0]
@@ -1186,7 +1504,11 @@ class OnlineDecoder:
                 self.last_insufficient_log_time = time.time()
             y = -1
         else:
-            y = self.classifier.predict(x)[0]   #predicts the selected key
+            estimator = getattr(self.classifier, "estimator", self.classifier)
+            if isinstance(estimator, pyntbci.classifiers.urCCA):
+                y = self._fit_predict_zero_training(x)
+            else:
+                y = self.classifier.predict(x)[0]   #predicts the selected key
             if y >= 0:
                 logger.info(f"[CHECK] Decoder classified with prediction {y}.")
 
@@ -1210,6 +1532,8 @@ class OnlineDecoder:
 
     def _best_effort_class(self, x: NDArray) -> int:
         estimator = getattr(self.classifier, "estimator", self.classifier)
+        if isinstance(estimator, pyntbci.classifiers.urCCA):
+            return self._fit_predict_zero_training(x)
         if not hasattr(estimator, "decision_function"):
             return -1
 
@@ -1230,8 +1554,73 @@ class OnlineDecoder:
 
         return int(np.nanargmax(scores))
 
+    def _fit_predict_zero_training(self, x: NDArray) -> int:
+        """Fit urCCA, estimate paper confidence, and update when reliable."""
+        estimator = getattr(self.classifier, "estimator", self.classifier)
+        previous_ccas = deepcopy(estimator.ccas)
+        try:
+            estimator.fit(x[0])
+            y = int(estimator.predict())
+            scores = np.asarray(estimator.rho, dtype=float)
+            confidence = self._zero_training_confidence(scores)
+            threshold = self._zero_training_confidence_threshold()
+            updated = (
+                getattr(self, "zero_training_cumulative_updates", True)
+                and confidence > threshold
+            )
+            if updated:
+                estimator.update(y)
+            else:
+                estimator.ccas = previous_ccas
+        except (ValueError, np.linalg.LinAlgError) as err:
+            estimator.ccas = previous_ccas
+            logger.warning(f"[CHECK] Calibration-free urCCA failed: {err}")
+            return -1
+
+        correlations = ", ".join(
+            f"target_{i + 1}={score:.6f}" for i, score in enumerate(scores)
+        )
+        logger.info(
+            f"[CHECK] Zero-training confidence analysis: trial={self.current_trial_id}, "
+            f"selected_target={y + 1}, selected_correlation={scores[y]:.6f}, "
+            f"confidence={confidence:.6f}, threshold={threshold:.6f}, "
+            f"cumulative_update={updated}, correlations=[{correlations}]."
+        )
+        return y
+
+    @staticmethod
+    def _zero_training_confidence(scores: NDArray) -> float:
+        """Compute the untrained Beta confidence from Thielen et al. (2021)."""
+        scores = np.asarray(scores, dtype=float)
+        scores = scores[np.isfinite(scores)]
+        if scores.size < 3:
+            return 0.0
+
+        scores = np.sort(scores)
+        try:
+            a, b, loc, scale = beta.fit(scores[:-1], floc=-1, fscale=2)
+            confidence = beta.cdf(scores[-1], a, b, loc, scale) ** scores.size
+        except (ValueError, FloatingPointError):
+            return 0.0
+        return float(np.clip(confidence, 0.0, 1.0))
+
+    def _zero_training_confidence_threshold(self) -> float:
+        if self.current_trial_id == 1:
+            return self.first_trial_target_accuracy
+        if self.classifier_meta is None:
+            return 0.95
+        return float(self.classifier_meta.get("target_accuracy", 0.95))
+
     def _push_decision(self, y: int, x: NDArray) -> None:
         decision_trial_id = self.current_trial_id
+        if decision_trial_id is not None and decision_trial_id in self.completed_udp_trial_ids:
+            logger.info(
+                f"[CHECK] Trial {decision_trial_id}: duplicate decoder decision suppressed."
+            )
+            self.is_decoding = False
+            self.current_trial_id = None
+            return
+
         if self.udp_trial_timer is not None:
             self.udp_trial_timer.cancel()
             self.udp_trial_timer = None
@@ -1255,25 +1644,34 @@ class OnlineDecoder:
         self.current_trial_id = None
 
     def _send_udp_decision(self, payload: str) -> None:
-        if self.decoder_output_udp_socket is None or self.decoder_output_udp_port is None:
+        if self.decoder_output_udp_socket is None:
             return
 
-        try:
-            self.decoder_output_udp_socket.sendto(
-                payload.encode("utf-8"),
-                (self.decoder_output_udp_host, self.decoder_output_udp_port),
-            )
-        except OSError as err:
-            logger.warning(
-                f"[CHECK] Could not send UDP decoder output to "
-                f"{self.decoder_output_udp_host}:{self.decoder_output_udp_port}: {err}"
-            )
-            return
+        ports = []
+        for port in (
+                self.decoder_output_udp_port,
+                self.decoder_output_udp_fallback_port,
+        ):
+            if port is not None and port not in ports:
+                ports.append(port)
 
-        logger.info(
-            f"[CHECK] Sent UDP decoder output '{payload}' to "
-            f"{self.decoder_output_udp_host}:{self.decoder_output_udp_port}."
-        )
+        for port in ports:
+            try:
+                self.decoder_output_udp_socket.sendto(
+                    payload.encode("utf-8"),
+                    (self.decoder_output_udp_host, port),
+                )
+            except OSError as err:
+                logger.warning(
+                    f"[CHECK] Could not send UDP decoder output to "
+                    f"{self.decoder_output_udp_host}:{port}: {err}"
+                )
+                continue
+
+            logger.info(
+                f"[CHECK] Sent UDP decoder output '{payload}' to "
+                f"{self.decoder_output_udp_host}:{port}."
+            )
 
     def _soft_decision_position(self, x: NDArray) -> NDArray:
         """Convert all rCCA class scores into a smoothed 2D position."""
@@ -1370,6 +1768,9 @@ def online_decoder_factory(
         marker_udp_port=cfg["streams"].get("marker_udp_port", None),
         decoder_output_udp_host=cfg["streams"].get("decoder_output_udp_host", "127.0.0.1"),
         decoder_output_udp_port=cfg["streams"].get("decoder_output_udp_port", None),
+        decoder_output_udp_fallback_port=cfg["streams"].get(
+            "decoder_output_udp_fallback_port", None
+        ),
         data_stream_name=cfg["streams"]["data_stream_name"],
         decoder_stream_name=cfg["streams"]["decoder_stream_name"],
         buffer_size_s=cfg["streams"]["buffer_size_s"],
@@ -1377,6 +1778,9 @@ def online_decoder_factory(
         start_eval_marker=cfg["stimulus"]["trial_marker"],
         max_eval_time_s=cfg["online"]["max_eval_time_s"],
         first_trial_max_eval_time_s=cfg["online"].get("first_trial_max_eval_time_s", None),
+        first_trial_target_accuracy=cfg["online"].get(
+            "first_trial_target_accuracy", 0.99
+        ),
         t_sleep_s=cfg["online"].get("sleep_s", 0.1),
         selected_channels=cfg["data"].get("selected_channels", None),
         n_positions=cfg["stimulus"].get("n_keys", 0),
@@ -1384,6 +1788,10 @@ def online_decoder_factory(
         soft_decision_smoothing=cfg["decoder"].get("soft_decision_smoothing", 0.5),
         soft_decision_min_confidence=cfg["decoder"].get("soft_decision_min_confidence", 0.0),
         soft_decision_temperature=cfg["decoder"].get("soft_decision_temperature", 1.0),
+        max_eeg_age_s=cfg["online"].get("max_eeg_age_s", 0.5),
+        zero_training_cumulative_updates=cfg["decoder"].get(
+            "zero_training_cumulative_updates", True
+        ),
     )
 
     if preload:

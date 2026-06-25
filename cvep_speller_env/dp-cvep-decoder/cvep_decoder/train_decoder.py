@@ -15,7 +15,6 @@ import toml
 from scipy.signal import resample
 
 from cvep_decoder.utils.logging import logger
-from cvep_decoder.zero_training import ZeroTrainingClassifier
 
 
 @dataclass
@@ -185,11 +184,24 @@ def create_classifier(
             int(cmeta.sfreq / cmeta.presentation_rate),
             axis=1,
         )
-        logger.info("[CHECK] Creating zero-training decoder without calibration data.")
+        n_keys = cfg["stimulus"]["n_keys"]
+        n_selected = n_keys if n_keys != 0 else V.shape[0]
+        if n_selected > V.shape[0]:
+            logger.error(
+                f"Requested {n_selected} keys, but the code file contains only {V.shape[0]} codes."
+            )
+            return 1
+
+        subset = np.arange(n_selected)
+        layout = np.arange(n_selected)
+        V = V[subset, :]
+        logger.info(
+            "[CHECK] Creating calibration-free cumulative urCCA decoder "
+            "without labeled calibration data."
+        )
         logger.debug(f"The stimuli V are of shape: {V.shape} (codes x samples)")
 
         model = get_zero_training_model(cmeta, V)
-        subset, layout = select_codes_and_layout(model, V, cfg)
         save_classifier_outputs(model, cmeta, subset, layout, cfg)
         return 0
 
@@ -337,17 +349,36 @@ def get_rcca_model(
 def get_zero_training_model(
     cmeta: ClassifierMeta,
     V: NDArray,
-) -> ZeroTrainingClassifier:
-    return ZeroTrainingClassifier(
+) -> pyntbci.classifiers.urCCA:
+    """Create PyntBCI's calibration-free reconvolution CCA decoder."""
+    model = pyntbci.classifiers.urCCA(
         stimulus=V,
         fs=int(cmeta.sfreq),
         event=cmeta.event,
         onset_event=cmeta.onset_event,
-        response_length=cmeta.encoding_length,
-        tmin=cmeta.ctmin,
-        min_time=cmeta.min_time,
-        max_time=cmeta.max_time,
+        encoding_length=cmeta.encoding_length,
     )
+
+    # urCCA does not expose rCCA's tmin argument, so apply the same delay to
+    # its complete stimulus structure matrix before splitting it again.
+    shift_samples = int(round(cmeta.ctmin * cmeta.sfreq))
+    if shift_samples != 0:
+        structure = np.concatenate((model.Ms, model.Mw), axis=2)
+        if abs(shift_samples) >= structure.shape[2]:
+            raise ValueError("Zero-training tmin exceeds the stimulus duration.")
+
+        shifted = np.zeros_like(structure)
+        if shift_samples > 0:
+            shifted[:, :, shift_samples:] = structure[:, :, :-shift_samples]
+        else:
+            shifted[:, :, :shift_samples] = structure[:, :, -shift_samples:]
+
+        split = model.Ms.shape[2]
+        model.Ms = shifted[:, :, :split]
+        model.Mw = shifted[:, :, split:]
+
+    model.tmin = float(cmeta.ctmin)
+    return model
 
 
 def select_codes_and_layout(
