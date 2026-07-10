@@ -171,6 +171,7 @@ class OnlineDecoder:
         self.eeg_update_thread: threading.Thread | None = None
         self.eeg_update_stop_event: threading.Event | None = None
         self.udp_trial_timer: threading.Timer | None = None
+        self.last_zero_training_confidence: float = 0.0
         self.run_lock = threading.Lock()
         self.processing_lock = threading.Lock()
         self.eeg_update_interval_s = min(max(self.t_sleep_s, 0.005), 0.02)
@@ -192,6 +193,23 @@ class OnlineDecoder:
             return float(self.first_trial_max_eval_time_s)
 
         return float(self.max_eval_time_s)
+
+    def _min_eval_time_for_trial(self, trial_id: int | None = None) -> float:
+        max_eval_time_s = self._max_eval_time_for_trial(trial_id)
+        if self.classifier_meta is None:
+            return min(3.5, max_eval_time_s)
+        return min(
+            max(0.1, float(self.classifier_meta.get("min_time", 3.5))),
+            max_eval_time_s,
+        )
+
+    def _early_stop_check_interval_s(self) -> float:
+        if self.classifier_meta is None:
+            return 0.1
+        return max(
+            0.1,
+            float(self.classifier_meta.get("segment_time_s", 0.1)),
+        )
 
     # -------- Connection and initialization methods --------------------------
     def load_model(
@@ -1147,9 +1165,17 @@ class OnlineDecoder:
             )
             self._handle_udp_force_decision(trial_id, sent_time=sent_time)
         else:
+            if trial_id == 1:
+                min_eval_time_s = max_eval_time_s
+                logger.info(
+                    f"[CHECK] Trial 1: early stopping disabled; "
+                    f"using the full {max_eval_time_s:.3f}s warm-up window."
+                )
+            else:
+                min_eval_time_s = self._min_eval_time_for_trial(trial_id)
             self._schedule_udp_auto_decision(
                 trial_id,
-                delay_s=max(0.1, max_eval_time_s - processing_age_s),
+                delay_s=max(0.1, min_eval_time_s - processing_age_s),
             )
 
     def _schedule_udp_auto_decision(
@@ -1172,7 +1198,7 @@ class OnlineDecoder:
         self.udp_trial_timer.daemon = True
         self.udp_trial_timer.start()
         logger.info(
-            f"[CHECK] Trial {trial_id}: scheduled automatic rCCA decision "
+            f"[CHECK] Trial {trial_id}: scheduled rCCA confidence check "
             f"in {delay_s:.3f}s."
         )
 
@@ -1186,8 +1212,75 @@ class OnlineDecoder:
             )
             return
 
-        logger.info(f"[CHECK] Trial {trial_id}: automatic rCCA decision starting.")
-        self._handle_udp_force_decision(trial_id, sent_time=None)
+        elapsed_s = max(0.0, time.time() - self.internal_decoding_start_time)
+        max_eval_time_s = self._max_eval_time_for_trial(trial_id)
+        if elapsed_s >= max_eval_time_s - 0.05:
+            logger.info(f"[CHECK] Trial {trial_id}: maximum-time rCCA decision starting.")
+            self._handle_udp_force_decision(trial_id, sent_time=None)
+            return
+
+        if self._try_udp_early_decision(trial_id, elapsed_s):
+            return
+
+        remaining_s = max_eval_time_s - elapsed_s
+        self._schedule_udp_auto_decision(
+            trial_id,
+            delay_s=min(self._early_stop_check_interval_s(), remaining_s),
+        )
+
+    def _try_udp_early_decision(self, trial_id: int, elapsed_s: float) -> bool:
+        if trial_id == 1:
+            return False
+
+        estimator = getattr(self.classifier, "estimator", self.classifier)
+        if not isinstance(estimator, pyntbci.classifiers.urCCA):
+            return False
+
+        with self.processing_lock:
+            if (
+                    trial_id in self.completed_udp_trial_ids
+                    or not self.is_decoding
+                    or self.current_trial_id != trial_id
+            ):
+                return False
+            if not self._update_eeg_filter_once():
+                logger.info(
+                    f"[CHECK] Trial {trial_id}: early-stop check postponed because "
+                    "the EEG filter could not be updated."
+                )
+                return False
+
+            eeg_times = self.input_sw.unfold_buffer_t()
+            eeg_times = eeg_times[np.isfinite(eeg_times)]
+            eeg_error = self._validate_fresh_eeg(eeg_times, elapsed_s)
+            if eeg_error is not None:
+                logger.info(
+                    f"[CHECK] Trial {trial_id}: early-stop check postponed because "
+                    f"{eeg_error}."
+                )
+                return False
+
+            x = self._create_epoch()
+            if x.shape[2] <= 0:
+                return False
+
+            xs = self._resample(x)
+            y = self._best_effort_class(xs)
+            confidence = self.last_zero_training_confidence
+            threshold = self._zero_training_confidence_threshold()
+            if y >= 0 and confidence >= threshold:
+                logger.info(
+                    f"[CHECK] Trial {trial_id}: early stopping at {elapsed_s:.3f}s "
+                    f"(confidence={confidence:.6f}, threshold={threshold:.6f})."
+                )
+                self._push_decision(y, xs)
+                return True
+
+            logger.info(
+                f"[CHECK] Trial {trial_id}: continuing stimulation at {elapsed_s:.3f}s "
+                f"(confidence={confidence:.6f}, threshold={threshold:.6f})."
+            )
+            return False
 
     def _handle_udp_force_decision(self, trial_id: int | None, sent_time: float | None = None) -> None:
         if trial_id is not None and trial_id in self.completed_udp_trial_ids:
@@ -1590,11 +1683,13 @@ class OnlineDecoder:
         """Fit urCCA, estimate paper confidence, and update when reliable."""
         estimator = getattr(self.classifier, "estimator", self.classifier)
         previous_ccas = deepcopy(estimator.ccas)
+        self.last_zero_training_confidence = 0.0
         try:
             estimator.fit(x[0])
             y = int(estimator.predict())
             scores = np.asarray(estimator.rho, dtype=float)
             confidence = self._zero_training_confidence(scores)
+            self.last_zero_training_confidence = confidence
             threshold = self._zero_training_confidence_threshold()
             updated = (
                 getattr(self, "zero_training_cumulative_updates", True)
